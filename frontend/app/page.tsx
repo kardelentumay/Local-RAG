@@ -442,8 +442,6 @@ export default function Home() {
                     )}
                     <div className="message-actions">
                       <button onClick={() => navigator.clipboard.writeText(exchange.answer).then(() => setNotice("The answer was copied to the clipboard."))}>Copy</button>
-                      <button onClick={() => setNotice("Positive feedback was saved (demo).")}>Good answer</button>
-                      <button onClick={() => setNotice("The feedback panel was opened (demo).")}>Needs improvement</button>
                     </div>
                   </div>
                 </div>
