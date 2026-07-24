@@ -150,7 +150,11 @@ class RAGService:
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
-        expanded_top_k = max(top_k, 6) if scope_term and top_k > 1 else top_k
+        expanded_top_k = (
+            max(top_k, 6)
+            if top_k > 1 and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
+            else top_k
+        )
         results = self.search(question, expanded_top_k)
         validation_query = _without_term(retrieval_query, scope_term)
         relevance_results = [
@@ -525,8 +529,10 @@ def _has_relevant_evidence(
     if allow_single_term:
         return (
             distinctive_matches >= 1
-            and len(matched_terms) / len(query_terms) >= 0.5
+            and len(matched_terms) / len(query_terms) >= 0.2
         )
+    if distinctive_matches >= 2 and len(matched_terms) / len(query_terms) >= 0.2:
+        return True
     return (
         len(matched_terms) >= 2
         and distinctive_matches >= 2
