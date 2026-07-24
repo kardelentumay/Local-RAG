@@ -8,7 +8,12 @@ from local_rag.service import (
     FALLBACK_ANSWER_TR,
     RAGService,
     _context_excerpt,
+    _build_answer_prompt,
+    _has_relevant_evidence,
     _hybrid_fuse,
+    _normalize_retrieval_query,
+    _rarest_term_sources,
+    _rerank_section_matches,
     _validate_citations,
 )
 from local_rag.store import SQLiteStore
@@ -75,10 +80,19 @@ class ServiceTests(unittest.TestCase):
         uploads.mkdir()
         uploaded = uploads / "notes.md"
         uploaded.write_text("RAG kaynaklarla yanıt üretir.", encoding="utf-8")
-        report = self.service.ingest(uploaded, source_root=self.docs)
+        report = self.service.ingest(
+            uploaded,
+            source_root=self.docs,
+            category="Course Notes",
+        )
         self.assertEqual(1, report.processed)
         sources = {item["source"] for item in self.store.list_documents()}
         self.assertIn("uploads/notes.md", sources)
+        uploaded_item = next(
+            item for item in self.store.list_documents()
+            if item["source"] == "uploads/notes.md"
+        )
+        self.assertEqual("Course Notes", uploaded_item["category"])
 
     def test_store_lists_and_deletes_document_with_chunks(self):
         self.service.ingest(self.docs, chunk_size=100, overlap=10)
@@ -95,6 +109,37 @@ class ServiceTests(unittest.TestCase):
         results = self.store.keyword_search("bilgisayar", 5)
         self.assertTrue(results)
         self.assertEqual("program.md", results[0].source)
+
+    def test_keyword_search_can_be_scoped_to_selected_documents(self):
+        (self.docs / "other.md").write_text(
+            "This document describes software projects.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        results = self.store.keyword_search(
+            "projects",
+            5,
+            sources=["other.md"],
+        )
+        self.assertTrue(results)
+        self.assertEqual({"other.md"}, {item.source for item in results})
+
+    def test_rarest_term_identifies_document_scope(self):
+        (self.docs / "cv.md").write_text(
+            "Kardelen Tumay\nProjects\nLocal RAG application.",
+            encoding="utf-8",
+        )
+        (self.docs / "paper.md").write_text(
+            "Projects can use retrieval augmented generation.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        sources = _rarest_term_sources(
+            self.store,
+            "What are Kardelen's projects?",
+            20,
+        )
+        self.assertEqual(["cv.md"], sources)
 
     def test_store_returns_previous_chunk_window(self):
         self.service.ingest(self.docs, chunk_size=100, overlap=10)
@@ -199,7 +244,99 @@ class ServiceTests(unittest.TestCase):
         ]
         results = _hybrid_fuse(vector, keyword, 2)
         self.assertEqual("shared.md", results[0].source)
-        self.assertGreater(results[0].score, results[1].score)
+        self.assertEqual(0.8, results[0].score)
+
+    def test_hybrid_fusion_keeps_semantic_confidence_for_keyword_match(self):
+        vector = [
+            SearchResult("paper.md", 1, "Generic model value table.", 0.21),
+        ]
+        keyword = [
+            SearchResult("paper.md", 1, "Generic model value table.", 9.0),
+        ]
+        results = _hybrid_fuse(vector, keyword, 1)
+        self.assertEqual(0.21, results[0].score)
+
+    def test_keyword_only_result_beats_equally_ranked_vector_only_result(self):
+        vector = [
+            SearchResult("generic.md", 1, "Generic vector result", 0.50),
+        ]
+        keyword = [
+            SearchResult("cv.pdf", 9, "Kardelen certificate list", 8.0),
+        ]
+        results = _hybrid_fuse(vector, keyword, 2)
+        self.assertEqual("cv.pdf", results[0].source)
+
+    def test_section_heading_is_ranked_before_incidental_term_match(self):
+        results = [
+            SearchResult(
+                "cv.pdf",
+                1,
+                "Through personal projects, I used React and Node.js.",
+                0.8,
+            ),
+            SearchResult(
+                "cv.pdf",
+                2,
+                "Projects\nLibrary Reservation System\nInventory System",
+                0.7,
+            ),
+        ]
+        ranked = _rerank_section_matches("projects", results, 2)
+        self.assertEqual(2, ranked[0].position)
+
+    def test_off_topic_question_is_rejected_before_chat_generation(self):
+        class UnexpectedChat:
+            def complete(self, messages):
+                raise AssertionError("Chat generation must not run for an unrelated question.")
+
+        service = RAGService(self.store, KeywordEmbeddings(), UnexpectedChat())
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("What is the Bitcoin value today?", 2)
+        self.assertEqual(FALLBACK_ANSWER_EN, answer.text)
+        self.assertEqual([], answer.sources)
+
+    def test_low_semantic_score_is_accepted_with_strong_fuzzy_text_evidence(self):
+        results = [
+            SearchResult(
+                "cv.pdf",
+                8,
+                "Kardelen Tumay\nSertificates\nArtificial Intelligence Training",
+                0.42,
+            )
+        ]
+        self.assertTrue(
+            _has_relevant_evidence("What are Kardelen's certificates?", results)
+        )
+
+    def test_generic_word_overlap_does_not_admit_off_topic_question(self):
+        results = [
+            SearchResult(
+                "evaluation.md",
+                3,
+                "The best value in each model category is shown in bold.",
+                0.50,
+            )
+        ]
+        self.assertFalse(
+            _has_relevant_evidence("What is the Bitcoin value today?", results)
+        )
+
+    def test_scoped_document_accepts_one_strong_subject_term(self):
+        results = [
+            SearchResult(
+                "cv.pdf",
+                6,
+                "Experience\nSoftware Development Intern",
+                0.40,
+            )
+        ]
+        self.assertTrue(
+            _has_relevant_evidence(
+                "work experience",
+                results,
+                allow_single_term=True,
+            )
+        )
 
     def test_context_excerpt_removes_unrelated_sentences(self):
         content = (
@@ -223,6 +360,39 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("static workflows", excerpt)
         self.assertIn("autonomous agents", excerpt)
         self.assertNotIn("Healthcare", excerpt)
+
+    def test_context_excerpt_recovers_minor_heading_misspelling(self):
+        content = (
+            "Languages: Turkish and English. "
+            "Sertificates: Artificial Intelligence Training and RPA Training. "
+            "Kardelen Tumay - CV."
+        )
+        excerpt = _context_excerpt("What are Kardelen's certificates?", content)
+        self.assertIn("Artificial Intelligence Training", excerpt)
+
+    def test_english_question_uses_fully_english_answer_prompt(self):
+        prompt = _build_answer_prompt(
+            "What are Kardelen's certificates?",
+            "Sertificates: Artificial Intelligence Training.",
+        )
+        self.assertIn("CONTEXT:", prompt)
+        self.assertIn("QUESTION:", prompt)
+        self.assertIn("Answer only in English", prompt)
+        self.assertNotIn("BAĞLAM", prompt)
+
+    def test_retrieval_query_corrects_certificate_typo(self):
+        self.assertEqual(
+            "what are the certificates of Kardelen",
+            _normalize_retrieval_query("what are the sertificates of Kardelen"),
+        )
+
+    def test_retrieval_query_removes_conversational_filler(self):
+        self.assertEqual(
+            "education kardelen",
+            _normalize_retrieval_query(
+                "Give me the education information about kardelen"
+            ),
+        )
 
     def test_citation_validator_removes_out_of_range_numbers(self):
         answer = _validate_citations("First claim [1]. Invalid claim [3]. Second [2].", 2)

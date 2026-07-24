@@ -4,6 +4,7 @@ import hashlib
 import re
 from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .documents import chunk_text, discover_documents, read_document
@@ -63,6 +64,7 @@ class RAGService:
         overlap: int = 100,
         batch_size: int = 16,
         source_root: Path | None = None,
+        category: str = "RAG Research",
     ) -> IngestReport:
         if batch_size < 1:
             raise ValueError("batch_size en az 1 olmalıdır")
@@ -81,7 +83,7 @@ class RAGService:
             vectors: list[list[float]] = []
             for start in range(0, len(chunks), batch_size):
                 vectors.extend(self.embeddings.embed([item.content for item in chunks[start : start + batch_size]]))
-            self.store.replace_document(source, digest, chunks, vectors)
+            self.store.replace_document(source, digest, chunks, vectors, category)
             processed += 1
             total_chunks += len(chunks)
         return IngestReport(processed, skipped, total_chunks)
@@ -90,8 +92,14 @@ class RAGService:
         clean = question.strip()
         if not clean:
             raise ValueError("Soru boş olamaz")
+        retrieval_query = _normalize_retrieval_query(clean)
         candidate_count = max(top_k * 10, 20)
-        results = self._retrieve(clean, candidate_count, top_k)
+        results = self._retrieve(
+            retrieval_query,
+            candidate_count,
+            top_k,
+            use_scope=not _has_named_anchor(clean),
+        )
         facets = _comparison_facets(clean)
         if len(facets) != 2 or top_k < 2:
             return results
@@ -115,26 +123,96 @@ class RAGService:
                 break
         return balanced[:top_k]
 
-    def _retrieve(self, query: str, candidate_count: int, top_k: int) -> list[SearchResult]:
-        instructed_query = f"{RETRIEVAL_INSTRUCTION}{query}"
-        vector_results = self.store.search(self.embeddings.embed([instructed_query])[0], candidate_count)
-        keyword_results = self.store.keyword_search(query, candidate_count)
-        return _hybrid_fuse(vector_results, keyword_results, top_k)
+    def _retrieve(
+        self,
+        query: str,
+        candidate_count: int,
+        top_k: int,
+        use_scope: bool = True,
+    ) -> list[SearchResult]:
+        scope_term, scoped_sources = _rarest_term_scope(
+            self.store, query, candidate_count
+        ) if use_scope else ("", [])
+        content_query = (
+            _without_term(query, scope_term) if scoped_sources else query
+        )
+        instructed_query = f"{RETRIEVAL_INSTRUCTION}{content_query}"
+        query_embedding = self.embeddings.embed([instructed_query])[0]
+        vector_results = self.store.search(
+            query_embedding, candidate_count, scoped_sources or None
+        )
+        keyword_results = self.store.keyword_search(
+            content_query, candidate_count, scoped_sources or None
+        )
+        fused = _hybrid_fuse(
+            vector_results,
+            keyword_results,
+            candidate_count if scoped_sources else top_k,
+            per_source_limit=candidate_count if scoped_sources else 2,
+        )
+        if scoped_sources:
+            return _rerank_section_matches(query, fused, top_k)
+        return fused[:top_k]
 
     def answer(self, question: str, top_k: int = 3) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
-        results = self.search(question, top_k)
-        if not results or max(item.score for item in results) < MIN_ANSWER_RELEVANCE:
+        retrieval_query = _normalize_retrieval_query(question)
+        scope_term, _ = _rarest_term_scope(
+            self.store, retrieval_query, max(top_k * 10, 20)
+        )
+        expanded_top_k = (
+            max(top_k, 6)
+            if top_k > 1
+            and not _has_named_anchor(question)
+            and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
+            else top_k
+        )
+        if _has_named_anchor(question):
+            results = self._retrieve(retrieval_query, 40, expanded_top_k, use_scope=False)
+        else:
+            results = self.search(question, expanded_top_k)
+
+        structured = self._structured_document_answer(question, results)
+        if structured is not None:
+            return structured
+
+        if _is_project_list_question(question) and scope_term:
+            scoped_sources = _rarest_term_sources(
+                self.store, retrieval_query, max(top_k * 10, 20)
+            )
+            if scoped_sources:
+                project_section = _extract_section(
+                    self.store.get_document_content(scoped_sources[0]),
+                    "Projects",
+                    ("Experience", "Education", "Skills", "Certificates"),
+                )
+                if project_section:
+                    results = [
+                        SearchResult(scoped_sources[0], 0, project_section, 1.0)
+                    ]
+        validation_query = _without_term(retrieval_query, scope_term)
+        relevance_results = [
+            SearchResult(
+                item.source,
+                item.position,
+                self.store.get_window(item.source, item.position, 1, 2),
+                item.score,
+            )
+            for item in results
+        ]
+        if not _has_relevant_evidence(
+            validation_query,
+            relevance_results,
+            allow_single_term=bool(scope_term),
+            allow_named_anchor=_has_named_anchor(question),
+        ):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
-            f"[{index}]\n{_context_excerpt(question, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
+            f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 2), 1500 if scope_term else 1100)}"
             for index, item in enumerate(results, start=1)
         )
-        prompt = (
-            f"BAĞLAM:\n{context}\n\nSORU:\n{question.strip()}\n\n"
-            "ÖNEMLİ: Yanıtı sorunun dilinde yaz ve bağlamda açıkça desteklenmeyen hiçbir ayrıntı ekleme."
-        )
+        prompt = _build_answer_prompt(question, context)
         text = self.chat.complete([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}])
         if _is_refusal(text.strip()):
             text = self.chat.complete(
@@ -156,11 +234,108 @@ class RAGService:
                     },
                 ]
             )
+        elif not _is_turkish(question) and _looks_turkish(text):
+            text = self.chat.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a translation editor. Translate the supplied answer completely "
+                            "into English. Do not add or remove information, and preserve the source "
+                            "numbers [1], [2], and [3] exactly."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Write the following text entirely in English:\n\n{text.strip()}",
+                    },
+                ]
+            )
+        if _is_project_list_question(question) and _needs_project_completion(text):
+            text = self.chat.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Extract the complete project list from the context. Return each "
+                            "project as one bullet: project name — one short description. "
+                            "Use only the context and include every project."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            )
         clean_answer = text.strip()
         if _is_refusal(clean_answer) or _has_degenerate_repetition(clean_answer):
             return Answer(_fallback_for(question), [])
         clean_answer = _validate_citations(clean_answer, len(results))
         return Answer(clean_answer, results)
+
+    def _structured_document_answer(
+        self, question: str, results: list[SearchResult]
+    ) -> Answer | None:
+        if not results:
+            return None
+
+        lowered_question = question.lower()
+        unique_results = list(
+            {
+                result.source: result
+                for result in results
+            }.values()
+        )
+
+        if _is_project_list_question(question):
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    "Projects",
+                    ("Experience", "Education", "Skills", "Certificates", "Sertificates"),
+                )
+                projects = _extract_projects(section)
+                if projects:
+                    bullets = "\n".join(
+                        f"- {name} — {description} [1]"
+                        for name, description in projects
+                    )
+                    return Answer(bullets, [result])
+
+        if "education" in lowered_question or "eğitim" in lowered_question:
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    "Education",
+                    ("Projects", "Experience", "Skills"),
+                )
+                education = _format_education(section)
+                if education:
+                    return Answer(f"{education} [1]", [result])
+
+        if "technolog" not in lowered_question:
+            return None
+
+        query_terms = _meaningful_terms(question)
+        candidates: list[tuple[int, SearchResult, str]] = []
+        for result in unique_results:
+            content = self.store.get_document_content(result.source)
+            for match in re.finditer(
+                r"(?im)^\s*Technologies\s*:\s*([^\r\n]+)", content
+            ):
+                nearby = content[max(0, match.start() - 900) : match.start()]
+                nearby_terms = _meaningful_terms(nearby)
+                score = sum(
+                    1
+                    for term in query_terms
+                    if any(_terms_are_close(term, item) for item in nearby_terms)
+                )
+                technologies = match.group(1).strip(" .")
+                candidates.append((score, result, technologies))
+        if not candidates:
+            return None
+        score, source, technologies = max(candidates, key=lambda item: item[0])
+        if score < 2:
+            return None
+        return Answer(f"{technologies}. [1]", [source])
 
 def _is_turkish(text: str) -> bool:
     lowered = text.lower()
@@ -179,6 +354,144 @@ def _looks_english(text: str) -> bool:
     english = sum(word in {"the", "and", "is", "are", "of", "to", "from", "with", "this", "that"} for word in words)
     turkish = sum(word in {"ve", "bir", "bu", "için", "ile", "olarak", "nedir", "olan"} for word in words)
     return english >= 3 and english > turkish * 2
+
+
+def _looks_turkish(text: str) -> bool:
+    lowered = text.lower()
+    turkish_characters = sum(lowered.count(character) for character in "çğıöşü")
+    words = re.findall(r"[^\W_]+", lowered, flags=re.UNICODE)
+    turkish_words = sum(
+        word in {"ve", "bir", "bu", "için", "ile", "olarak", "eğitimi", "gibi"}
+        for word in words
+    )
+    return turkish_characters >= 2 or turkish_words >= 3
+
+
+def _build_answer_prompt(question: str, context: str) -> str:
+    if _is_turkish(question):
+        return (
+            f"BAĞLAM:\n{context}\n\nSORU:\n{question.strip()}\n\n"
+            "ÖNEMLİ: Yanıtı yalnızca Türkçe yaz ve bağlamda açıkça desteklenmeyen "
+            "hiçbir ayrıntı ekleme."
+        )
+    technology_instruction = (
+        " For technology questions, return only the technologies explicitly listed "
+        "for the named project."
+        if "technolog" in question.lower()
+        else ""
+    )
+    return (
+        f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
+        "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
+        "the context. For list questions, extract every item under the relevant section "
+        "and return only short bullets; never stop after the first item. For project "
+        "lists, include each project name followed by one short supported description. "
+        f"Do not expand abbreviations or invent explanations.{technology_instruction}"
+    )
+
+
+def _normalize_retrieval_query(question: str) -> str:
+    normalized = question.strip()
+    typo_corrections = {
+        r"\bsertificates?\b": "certificates",
+        r"\bcertificats?\b": "certificates",
+    }
+    for pattern, replacement in typo_corrections.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    filler_patterns = (
+        r"^\s*(?:please\s+)?(?:give|show|tell)\s+me\s+(?:the\s+)?",
+        r"\b(?:the\s+)?information\s+about\b",
+        r"\b(?:the\s+)?details\s+about\b",
+    )
+    for pattern in filler_patterns:
+        normalized = re.sub(pattern, " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized or question.strip()
+
+
+def _is_project_list_question(question: str) -> bool:
+    lowered = question.lower()
+    return "project" in lowered or "proje" in lowered
+
+
+def _extract_section(
+    content: str, heading: str, following_headings: tuple[str, ...]
+) -> str:
+    start_match = re.search(
+        rf"(?im)^\s*{re.escape(heading)}\s*$", content
+    )
+    if not start_match:
+        return ""
+    end = len(content)
+    remainder = content[start_match.end() :]
+    for candidate in following_headings:
+        match = re.search(
+            rf"(?im)^\s*{re.escape(candidate)}\s*$", remainder
+        )
+        if match:
+            end = min(end, start_match.end() + match.start())
+    return content[start_match.start() : end].strip()
+
+
+def _extract_projects(section: str) -> list[tuple[str, str]]:
+    if not section:
+        return []
+    lines = [
+        re.sub(r"\s+", " ", line).strip(" \t•")
+        for line in section.splitlines()
+    ]
+    lines = [line for line in lines if line and line.lower() != "projects"]
+    role_words = ("developer", "designer", "manager", "engineer")
+    projects: list[tuple[str, str]] = []
+    for index in range(len(lines) - 1):
+        name = lines[index]
+        role = lines[index + 1].lower()
+        if (
+            not any(word in role for word in role_words)
+            or name.lower().startswith(("technologies:", "kardelen tumay"))
+            or name.startswith("•")
+        ):
+            continue
+        description_parts: list[str] = []
+        for line in lines[index + 2 :]:
+            lowered = line.lower()
+            if lowered.startswith("technologies:") or line.startswith("•"):
+                break
+            description_parts.append(line)
+            if re.search(r"[.!?]$", line):
+                break
+        description = " ".join(description_parts)
+        description = re.sub(r"(?<=[a-z])- (?=[a-z])", "", description)
+        sentence = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0]
+        if sentence:
+            projects.append((name, sentence))
+    return projects
+
+
+def _format_education(section: str) -> str:
+    if not section:
+        return ""
+    lines = [
+        re.sub(r"\s+", " ", line).strip(" \t•")
+        for line in section.splitlines()
+    ]
+    lines = [line for line in lines if line and line.lower() != "education"]
+    if len(lines) < 2:
+        return ""
+    institution = lines[0]
+    program = lines[1]
+    return f"{institution} — {program}."
+
+
+def _has_named_anchor(question: str) -> bool:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]+", question)
+    capitalized = [token for token in tokens[1:] if token[0].isupper()]
+    return len(capitalized) >= 2 or any(token.isupper() and len(token) >= 3 for token in capitalized)
+
+
+def _needs_project_completion(text: str) -> bool:
+    lowered = text.lower()
+    return len(text.split()) < 18 or "http" not in lowered and "system" not in lowered
 
 
 def _is_refusal(text: str) -> bool:
@@ -214,30 +527,85 @@ def _hybrid_fuse(
     keyword_results: list[SearchResult],
     top_k: int,
     rank_constant: int = 60,
+    per_source_limit: int = 2,
 ) -> list[SearchResult]:
     scores: dict[tuple[str, int], float] = {}
     items: dict[tuple[str, int], SearchResult] = {}
-    for result_list in (vector_results, keyword_results):
+    semantic_scores = {
+        (item.source, item.position): item.score for item in vector_results
+    }
+    for result_list, weight in ((vector_results, 1.0), (keyword_results, 1.2)):
         for rank, item in enumerate(result_list, start=1):
             key = (item.source, item.position)
             items[key] = item
-            scores[key] = scores.get(key, 0.0) + 1.0 / (rank_constant + rank)
+            scores[key] = scores.get(key, 0.0) + weight / (rank_constant + rank)
 
-    max_score = 2.0 / (rank_constant + 1)
     ranked = sorted(scores, key=scores.get, reverse=True)
     selected: list[SearchResult] = []
     source_counts: dict[str, int] = {}
     for key in ranked:
         item = items[key]
-        if source_counts.get(item.source, 0) >= 2:
+        if source_counts.get(item.source, 0) >= per_source_limit:
             continue
         selected.append(
-            SearchResult(item.source, item.position, item.content, min(scores[key] / max_score, 1.0))
+            SearchResult(
+                item.source,
+                item.position,
+                item.content,
+                semantic_scores.get(key, 0.0),
+            )
         )
         source_counts[item.source] = source_counts.get(item.source, 0) + 1
         if len(selected) == top_k:
             break
     return selected
+
+
+def _rerank_section_matches(
+    query: str,
+    results: list[SearchResult],
+    top_k: int,
+) -> list[SearchResult]:
+    query_terms = _meaningful_terms(query)
+    if not query_terms:
+        return results[:top_k]
+
+    def section_score(item: SearchResult) -> float:
+        best = 0.0
+        for line in item.content.splitlines():
+            clean = line.strip(" \t•-*:#")
+            if not clean:
+                continue
+            line_terms = _meaningful_terms(clean)
+            if not line_terms:
+                continue
+            matched = sum(
+                1
+                for query_term in query_terms
+                if any(
+                    _terms_are_close(query_term, line_term)
+                    for line_term in line_terms
+                )
+            )
+            coverage = matched / len(query_terms)
+            if matched:
+                best = max(best, coverage)
+            if (
+                len(clean) > 80
+                or re.search(r"[.!?]$", clean)
+                or not clean[0].isupper()
+                or "," in clean
+            ):
+                continue
+            if matched:
+                best = max(best, 1.0 + coverage)
+        return best
+
+    ranked = sorted(
+        enumerate(results),
+        key=lambda row: (-section_score(row[1]), row[0]),
+    )
+    return [item for _, item in ranked[:top_k]]
 
 
 def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
@@ -254,17 +622,51 @@ def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
         exact_matches = len(query_terms & sentence_terms)
         prefix_matches = sum(
             1 for query_term in query_terms
-            if any(term.startswith(query_term[:5]) or query_term.startswith(term[:5]) for term in sentence_terms)
+            if any(_terms_are_close(query_term, term) for term in sentence_terms)
         )
-        ranked.append((exact_matches * 2 + prefix_matches, index, sentence))
+        heading_bonus = (
+            3
+            if len(sentence) <= 80
+            and not re.search(r"[.!?]$", sentence)
+            and sentence[0].isupper()
+            and "," not in sentence
+            and (exact_matches or prefix_matches)
+            else 0
+        )
+        ranked.append(
+            (exact_matches * 2 + prefix_matches + heading_bonus, index, sentence)
+        )
     relevant = [item for item in sorted(ranked, key=lambda row: (-row[0], row[1])) if item[0] > 0]
     if not relevant:
         return " ".join(sentences)[:max_chars]
 
-    relevant_indices = [index for _, index, _ in relevant[:3]]
-    chosen_indices = set(range(min(relevant_indices), max(relevant_indices) + 1))
+    _, best_index, best_sentence = relevant[0]
+    is_heading = len(best_sentence) <= 80 and not re.search(
+        r"[.!?]$", best_sentence
+    ) and best_sentence[0].isupper() and "," not in best_sentence
+    if is_heading:
+        end_index = min(len(sentences), best_index + 30)
+        for index in range(best_index + 1, end_index):
+            if _looks_like_section_heading(sentences[index]):
+                end_index = index
+                break
+        chosen_indices = set(range(best_index, end_index))
+    else:
+        chosen_indices = {index for _, index, _ in relevant[:3]}
     excerpt = " ".join(sentences[index] for index in sorted(chosen_indices))
     return excerpt[:max_chars]
+
+
+def _looks_like_section_heading(sentence: str) -> bool:
+    clean = sentence.strip(" \t•-*:#")
+    words = clean.split()
+    return (
+        bool(clean)
+        and len(clean) <= 40
+        and len(words) <= 4
+        and clean[0].isupper()
+        and not re.search(r"[.!?,;:/()-]", clean)
+    )
 
 
 def _meaningful_terms(text: str) -> set[str]:
@@ -277,6 +679,112 @@ def _meaningful_terms(text: str) -> set[str]:
         token for token in re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
         if len(token) >= 3 and token not in stopwords
     }
+
+
+def _has_relevant_evidence(
+    question: str,
+    results: list[SearchResult],
+    allow_single_term: bool = False,
+    allow_named_anchor: bool = False,
+) -> bool:
+    if not results:
+        return False
+    if allow_named_anchor:
+        return True
+    if max(item.score for item in results) >= MIN_ANSWER_RELEVANCE:
+        return True
+
+    query_terms = _meaningful_terms(question)
+    if len(query_terms) == 1:
+        term = next(iter(query_terms))
+        evidence_terms = _meaningful_terms(
+            " ".join(item.content for item in results)
+        )
+        return (
+            any(_terms_are_close(term, evidence_term) for evidence_term in evidence_terms)
+            and max(item.score for item in results) >= 0.25
+        )
+    if not query_terms or (len(query_terms) < 2 and not allow_single_term):
+        return False
+    evidence_terms = _meaningful_terms(
+        " ".join(item.content for item in results)
+    )
+    matched_terms = {
+        query_term
+        for query_term in query_terms
+        if any(_terms_are_close(query_term, evidence_term) for evidence_term in evidence_terms)
+    }
+    distinctive_matches = sum(len(term) >= 6 for term in matched_terms)
+    if allow_single_term:
+        return (
+            distinctive_matches >= 1
+            and len(matched_terms) / len(query_terms) >= 0.2
+        )
+    if distinctive_matches >= 2 and len(matched_terms) / len(query_terms) >= 0.2:
+        return True
+    return (
+        len(matched_terms) >= 2
+        and distinctive_matches >= 2
+        and len(matched_terms) / len(query_terms) >= 0.6
+    )
+
+
+def _rarest_term_sources(
+    store: SQLiteStore,
+    query: str,
+    candidate_count: int,
+    max_sources: int = 3,
+) -> list[str]:
+    return _rarest_term_scope(
+        store, query, candidate_count, max_sources
+    )[1]
+
+
+def _rarest_term_scope(
+    store: SQLiteStore,
+    query: str,
+    candidate_count: int,
+    max_sources: int = 3,
+) -> tuple[str, list[str]]:
+    candidates: list[tuple[int, int, int, str, list[str]]] = []
+    matched_term_count = 0
+    for term in _meaningful_terms(query):
+        if len(term) < 4:
+            continue
+        matches = store.keyword_search(term, candidate_count)
+        sources = list(dict.fromkeys(item.source for item in matches))
+        if sources:
+            matched_term_count += 1
+        if 0 < len(sources) <= max_sources:
+            candidates.append(
+                (len(sources), -len(matches), -len(term), term, sources)
+            )
+    if not candidates or matched_term_count < 2:
+        return "", []
+    selected = min(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    )
+    return selected[3], selected[4]
+
+
+def _without_term(query: str, excluded_term: str) -> str:
+    if not excluded_term:
+        return query
+    return re.sub(
+        rf"\b{re.escape(excluded_term)}(?:'s)?\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+
+
+def _terms_are_close(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 6:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= 0.86
 
 
 def _comparison_facets(question: str) -> list[str]:

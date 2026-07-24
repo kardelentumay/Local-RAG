@@ -18,7 +18,6 @@ backend/src/*/*.egg-info/
 frontend/node_modules/
 frontend/.vinext/
 frontend/.next/
-frontend/build/
 frontend/dist/
 frontend/.wrangler/
 frontend/.env*
