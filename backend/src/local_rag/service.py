@@ -172,6 +172,7 @@ class RAGService:
             validation_query,
             relevance_results,
             allow_single_term=bool(scope_term),
+            allow_named_anchor=_has_named_anchor(question),
         ):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
@@ -515,9 +516,12 @@ def _has_relevant_evidence(
     question: str,
     results: list[SearchResult],
     allow_single_term: bool = False,
+    allow_named_anchor: bool = False,
 ) -> bool:
     if not results:
         return False
+    if allow_named_anchor:
+        return True
     if max(item.score for item in results) >= MIN_ANSWER_RELEVANCE:
         return True
 
