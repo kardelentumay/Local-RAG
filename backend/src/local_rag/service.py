@@ -140,7 +140,7 @@ class RAGService:
             per_source_limit=candidate_count if scoped_sources else 2,
         )
         if scoped_sources:
-            return _rerank_section_matches(content_query, fused, top_k)
+            return _rerank_section_matches(query, fused, top_k)
         return fused[:top_k]
 
     def answer(self, question: str, top_k: int = 3) -> Answer:
@@ -152,7 +152,9 @@ class RAGService:
         )
         expanded_top_k = (
             max(top_k, 6)
-            if top_k > 1 and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
+            if top_k > 1
+            and not _has_named_anchor(question)
+            and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
             else top_k
         )
         results = self.search(question, expanded_top_k)
@@ -272,13 +274,19 @@ def _build_answer_prompt(question: str, context: str) -> str:
             "ÖNEMLİ: Yanıtı yalnızca Türkçe yaz ve bağlamda açıkça desteklenmeyen "
             "hiçbir ayrıntı ekleme."
         )
+    technology_instruction = (
+        " For technology questions, return only the technologies explicitly listed "
+        "for the named project."
+        if "technolog" in question.lower()
+        else ""
+    )
     return (
         f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
         "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
         "the context. For list questions, extract every item under the relevant section "
         "and return only short bullets; never stop after the first item. For project "
         "lists, include each project name followed by one short supported description. "
-        "Do not expand abbreviations or invent explanations."
+        f"Do not expand abbreviations or invent explanations.{technology_instruction}"
     )
 
 
@@ -304,6 +312,11 @@ def _normalize_retrieval_query(question: str) -> str:
 def _is_project_list_question(question: str) -> bool:
     lowered = question.lower()
     return "project" in lowered or "proje" in lowered
+
+
+def _has_named_anchor(question: str) -> bool:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]+", question)
+    return any(token[0].isupper() for token in tokens[1:])
 
 
 def _needs_project_completion(text: str) -> bool:
@@ -391,13 +404,7 @@ def _rerank_section_matches(
         best = 0.0
         for line in item.content.splitlines():
             clean = line.strip(" \t•-*:#")
-            if (
-                not clean
-                or len(clean) > 80
-                or re.search(r"[.!?]$", clean)
-                or not clean[0].isupper()
-                or "," in clean
-            ):
+            if not clean:
                 continue
             line_terms = _meaningful_terms(clean)
             if not line_terms:
@@ -411,6 +418,15 @@ def _rerank_section_matches(
                 )
             )
             coverage = matched / len(query_terms)
+            if matched:
+                best = max(best, coverage)
+            if (
+                len(clean) > 80
+                or re.search(r"[.!?]$", clean)
+                or not clean[0].isupper()
+                or "," in clean
+            ):
+                continue
             if matched:
                 best = max(best, 1.0 + coverage)
         return best
