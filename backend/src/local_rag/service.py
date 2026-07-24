@@ -94,7 +94,12 @@ class RAGService:
             raise ValueError("Soru boş olamaz")
         retrieval_query = _normalize_retrieval_query(clean)
         candidate_count = max(top_k * 10, 20)
-        results = self._retrieve(retrieval_query, candidate_count, top_k)
+        results = self._retrieve(
+            retrieval_query,
+            candidate_count,
+            top_k,
+            use_scope=not _has_named_anchor(clean),
+        )
         facets = _comparison_facets(clean)
         if len(facets) != 2 or top_k < 2:
             return results
@@ -118,10 +123,16 @@ class RAGService:
                 break
         return balanced[:top_k]
 
-    def _retrieve(self, query: str, candidate_count: int, top_k: int) -> list[SearchResult]:
+    def _retrieve(
+        self,
+        query: str,
+        candidate_count: int,
+        top_k: int,
+        use_scope: bool = True,
+    ) -> list[SearchResult]:
         scope_term, scoped_sources = _rarest_term_scope(
             self.store, query, candidate_count
-        )
+        ) if use_scope else ("", [])
         content_query = (
             _without_term(query, scope_term) if scoped_sources else query
         )
@@ -157,7 +168,10 @@ class RAGService:
             and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
             else top_k
         )
-        results = self.search(question, expanded_top_k)
+        if _has_named_anchor(question):
+            results = self._retrieve(retrieval_query, 40, expanded_top_k, use_scope=False)
+        else:
+            results = self.search(question, expanded_top_k)
         validation_query = _without_term(retrieval_query, scope_term)
         relevance_results = [
             SearchResult(
@@ -317,7 +331,8 @@ def _is_project_list_question(question: str) -> bool:
 
 def _has_named_anchor(question: str) -> bool:
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]+", question)
-    return any(token[0].isupper() for token in tokens[1:])
+    capitalized = [token for token in tokens[1:] if token[0].isupper()]
+    return len(capitalized) >= 2 or any(token.isupper() and len(token) >= 3 for token in capitalized)
 
 
 def _needs_project_completion(text: str) -> bool:
