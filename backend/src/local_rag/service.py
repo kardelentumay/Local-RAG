@@ -119,16 +119,39 @@ class RAGService:
         return balanced[:top_k]
 
     def _retrieve(self, query: str, candidate_count: int, top_k: int) -> list[SearchResult]:
-        instructed_query = f"{RETRIEVAL_INSTRUCTION}{query}"
-        vector_results = self.store.search(self.embeddings.embed([instructed_query])[0], candidate_count)
-        keyword_results = self.store.keyword_search(query, candidate_count)
-        return _hybrid_fuse(vector_results, keyword_results, top_k)
+        scope_term, scoped_sources = _rarest_term_scope(
+            self.store, query, candidate_count
+        )
+        content_query = (
+            _without_term(query, scope_term) if scoped_sources else query
+        )
+        instructed_query = f"{RETRIEVAL_INSTRUCTION}{content_query}"
+        query_embedding = self.embeddings.embed([instructed_query])[0]
+        vector_results = self.store.search(
+            query_embedding, candidate_count, scoped_sources or None
+        )
+        keyword_results = self.store.keyword_search(
+            content_query, candidate_count, scoped_sources or None
+        )
+        fused = _hybrid_fuse(
+            vector_results,
+            keyword_results,
+            candidate_count if scoped_sources else top_k,
+            per_source_limit=candidate_count if scoped_sources else 2,
+        )
+        if scoped_sources:
+            return _rerank_section_matches(content_query, fused, top_k)
+        return fused[:top_k]
 
     def answer(self, question: str, top_k: int = 3) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
         retrieval_query = _normalize_retrieval_query(question)
         results = self.search(question, top_k)
+        scope_term, _ = _rarest_term_scope(
+            self.store, retrieval_query, max(top_k * 10, 20)
+        )
+        validation_query = _without_term(retrieval_query, scope_term)
         relevance_results = [
             SearchResult(
                 item.source,
@@ -138,7 +161,11 @@ class RAGService:
             )
             for item in results
         ]
-        if not _has_relevant_evidence(retrieval_query, relevance_results):
+        if not _has_relevant_evidence(
+            validation_query,
+            relevance_results,
+            allow_single_term=bool(scope_term),
+        ):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
             f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
@@ -286,6 +313,7 @@ def _hybrid_fuse(
     keyword_results: list[SearchResult],
     top_k: int,
     rank_constant: int = 60,
+    per_source_limit: int = 2,
 ) -> list[SearchResult]:
     scores: dict[tuple[str, int], float] = {}
     items: dict[tuple[str, int], SearchResult] = {}
@@ -303,7 +331,7 @@ def _hybrid_fuse(
     source_counts: dict[str, int] = {}
     for key in ranked:
         item = items[key]
-        if source_counts.get(item.source, 0) >= 2:
+        if source_counts.get(item.source, 0) >= per_source_limit:
             continue
         selected.append(
             SearchResult(
@@ -317,6 +345,50 @@ def _hybrid_fuse(
         if len(selected) == top_k:
             break
     return selected
+
+
+def _rerank_section_matches(
+    query: str,
+    results: list[SearchResult],
+    top_k: int,
+) -> list[SearchResult]:
+    query_terms = _meaningful_terms(query)
+    if not query_terms:
+        return results[:top_k]
+
+    def section_score(item: SearchResult) -> float:
+        best = 0.0
+        for line in item.content.splitlines():
+            clean = line.strip(" \t•-*:#")
+            if (
+                not clean
+                or len(clean) > 80
+                or re.search(r"[.!?]$", clean)
+                or not clean[0].isupper()
+                or "," in clean
+            ):
+                continue
+            line_terms = _meaningful_terms(clean)
+            if not line_terms:
+                continue
+            matched = sum(
+                1
+                for query_term in query_terms
+                if any(
+                    _terms_are_close(query_term, line_term)
+                    for line_term in line_terms
+                )
+            )
+            coverage = matched / len(query_terms)
+            if matched:
+                best = max(best, 1.0 + coverage)
+        return best
+
+    ranked = sorted(
+        enumerate(results),
+        key=lambda row: (-section_score(row[1]), row[0]),
+    )
+    return [item for _, item in ranked[:top_k]]
 
 
 def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
@@ -335,13 +407,32 @@ def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
             1 for query_term in query_terms
             if any(_terms_are_close(query_term, term) for term in sentence_terms)
         )
-        ranked.append((exact_matches * 2 + prefix_matches, index, sentence))
+        heading_bonus = (
+            3
+            if len(sentence) <= 80
+            and not re.search(r"[.!?]$", sentence)
+            and sentence[0].isupper()
+            and "," not in sentence
+            and (exact_matches or prefix_matches)
+            else 0
+        )
+        ranked.append(
+            (exact_matches * 2 + prefix_matches + heading_bonus, index, sentence)
+        )
     relevant = [item for item in sorted(ranked, key=lambda row: (-row[0], row[1])) if item[0] > 0]
     if not relevant:
         return " ".join(sentences)[:max_chars]
 
-    relevant_indices = [index for _, index, _ in relevant[:3]]
-    chosen_indices = set(range(min(relevant_indices), max(relevant_indices) + 1))
+    _, best_index, best_sentence = relevant[0]
+    is_heading = len(best_sentence) <= 80 and not re.search(
+        r"[.!?]$", best_sentence
+    ) and best_sentence[0].isupper() and "," not in best_sentence
+    if is_heading:
+        chosen_indices = set(
+            range(best_index, min(len(sentences), best_index + 9))
+        )
+    else:
+        chosen_indices = {index for _, index, _ in relevant[:3]}
     excerpt = " ".join(sentences[index] for index in sorted(chosen_indices))
     return excerpt[:max_chars]
 
@@ -358,14 +449,18 @@ def _meaningful_terms(text: str) -> set[str]:
     }
 
 
-def _has_relevant_evidence(question: str, results: list[SearchResult]) -> bool:
+def _has_relevant_evidence(
+    question: str,
+    results: list[SearchResult],
+    allow_single_term: bool = False,
+) -> bool:
     if not results:
         return False
     if max(item.score for item in results) >= MIN_ANSWER_RELEVANCE:
         return True
 
     query_terms = _meaningful_terms(question)
-    if len(query_terms) < 2:
+    if not query_terms or (len(query_terms) < 2 and not allow_single_term):
         return False
     evidence_terms = _meaningful_terms(
         " ".join(item.content for item in results)
@@ -376,10 +471,65 @@ def _has_relevant_evidence(question: str, results: list[SearchResult]) -> bool:
         if any(_terms_are_close(query_term, evidence_term) for evidence_term in evidence_terms)
     }
     distinctive_matches = sum(len(term) >= 6 for term in matched_terms)
+    if allow_single_term:
+        return (
+            distinctive_matches >= 1
+            and len(matched_terms) / len(query_terms) >= 0.5
+        )
     return (
         len(matched_terms) >= 2
         and distinctive_matches >= 2
         and len(matched_terms) / len(query_terms) >= 0.6
+    )
+
+
+def _rarest_term_sources(
+    store: SQLiteStore,
+    query: str,
+    candidate_count: int,
+    max_sources: int = 3,
+) -> list[str]:
+    return _rarest_term_scope(
+        store, query, candidate_count, max_sources
+    )[1]
+
+
+def _rarest_term_scope(
+    store: SQLiteStore,
+    query: str,
+    candidate_count: int,
+    max_sources: int = 3,
+) -> tuple[str, list[str]]:
+    candidates: list[tuple[int, int, int, str, list[str]]] = []
+    matched_term_count = 0
+    for term in _meaningful_terms(query):
+        if len(term) < 4:
+            continue
+        matches = store.keyword_search(term, candidate_count)
+        sources = list(dict.fromkeys(item.source for item in matches))
+        if sources:
+            matched_term_count += 1
+        if 0 < len(sources) <= max_sources:
+            candidates.append(
+                (len(sources), -len(matches), -len(term), term, sources)
+            )
+    if not candidates or matched_term_count < 2:
+        return "", []
+    selected = min(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    )
+    return selected[3], selected[4]
+
+
+def _without_term(query: str, excluded_term: str) -> str:
+    if not excluded_term:
+        return query
+    return re.sub(
+        rf"\b{re.escape(excluded_term)}(?:'s)?\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
     )
 
 

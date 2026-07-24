@@ -97,11 +97,26 @@ class SQLiteStore:
                 [(item.source, item.position, item.content) for item in chunks],
             )
 
-    def search(self, query_embedding: Sequence[float], top_k: int = 3) -> list[SearchResult]:
+    def search(
+        self,
+        query_embedding: Sequence[float],
+        top_k: int = 3,
+        sources: Sequence[str] | None = None,
+    ) -> list[SearchResult]:
         if top_k < 1:
             raise ValueError("top_k en az 1 olmalıdır")
         with closing(self._connect()) as db:
-            rows = db.execute("SELECT source, position, content, embedding FROM chunks").fetchall()
+            if sources:
+                placeholders = ",".join("?" for _ in sources)
+                rows = db.execute(
+                    "SELECT source, position, content, embedding FROM chunks "
+                    f"WHERE source IN ({placeholders})",
+                    tuple(sources),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT source, position, content, embedding FROM chunks"
+                ).fetchall()
         scored = []
         for row in rows:
             score = cosine_similarity(query_embedding, json.loads(row["embedding"]))
@@ -144,17 +159,31 @@ class SQLiteStore:
             db.execute("DELETE FROM documents WHERE source = ?", (source,))
         return True
 
-    def keyword_search(self, query: str, limit: int = 20) -> list[SearchResult]:
+    def keyword_search(
+        self,
+        query: str,
+        limit: int = 20,
+        sources: Sequence[str] | None = None,
+    ) -> list[SearchResult]:
         terms = _fts_terms(query)
         if not terms or limit < 1:
             return []
         expression = " OR ".join(f'"{term}"*' for term in terms)
         with closing(self._connect()) as db:
-            rows = db.execute(
-                "SELECT source, position, content, bm25(chunks_fts) AS rank "
-                "FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-                (expression, limit),
-            ).fetchall()
+            if sources:
+                placeholders = ",".join("?" for _ in sources)
+                rows = db.execute(
+                    "SELECT source, position, content, bm25(chunks_fts) AS rank "
+                    "FROM chunks_fts WHERE chunks_fts MATCH ? "
+                    f"AND source IN ({placeholders}) ORDER BY rank LIMIT ?",
+                    (expression, *sources, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT source, position, content, bm25(chunks_fts) AS rank "
+                    "FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (expression, limit),
+                ).fetchall()
         return [
             SearchResult(row["source"], int(row["position"]), row["content"], -float(row["rank"]))
             for row in rows

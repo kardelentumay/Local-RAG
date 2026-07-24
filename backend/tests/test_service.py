@@ -12,6 +12,8 @@ from local_rag.service import (
     _has_relevant_evidence,
     _hybrid_fuse,
     _normalize_retrieval_query,
+    _rarest_term_sources,
+    _rerank_section_matches,
     _validate_citations,
 )
 from local_rag.store import SQLiteStore
@@ -107,6 +109,37 @@ class ServiceTests(unittest.TestCase):
         results = self.store.keyword_search("bilgisayar", 5)
         self.assertTrue(results)
         self.assertEqual("program.md", results[0].source)
+
+    def test_keyword_search_can_be_scoped_to_selected_documents(self):
+        (self.docs / "other.md").write_text(
+            "This document describes software projects.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        results = self.store.keyword_search(
+            "projects",
+            5,
+            sources=["other.md"],
+        )
+        self.assertTrue(results)
+        self.assertEqual({"other.md"}, {item.source for item in results})
+
+    def test_rarest_term_identifies_document_scope(self):
+        (self.docs / "cv.md").write_text(
+            "Kardelen Tumay\nProjects\nLocal RAG application.",
+            encoding="utf-8",
+        )
+        (self.docs / "paper.md").write_text(
+            "Projects can use retrieval augmented generation.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        sources = _rarest_term_sources(
+            self.store,
+            "What are Kardelen's projects?",
+            20,
+        )
+        self.assertEqual(["cv.md"], sources)
 
     def test_store_returns_previous_chunk_window(self):
         self.service.ingest(self.docs, chunk_size=100, overlap=10)
@@ -233,6 +266,24 @@ class ServiceTests(unittest.TestCase):
         results = _hybrid_fuse(vector, keyword, 2)
         self.assertEqual("cv.pdf", results[0].source)
 
+    def test_section_heading_is_ranked_before_incidental_term_match(self):
+        results = [
+            SearchResult(
+                "cv.pdf",
+                1,
+                "Through personal projects, I used React and Node.js.",
+                0.8,
+            ),
+            SearchResult(
+                "cv.pdf",
+                2,
+                "Projects\nLibrary Reservation System\nInventory System",
+                0.7,
+            ),
+        ]
+        ranked = _rerank_section_matches("projects", results, 2)
+        self.assertEqual(2, ranked[0].position)
+
     def test_off_topic_question_is_rejected_before_chat_generation(self):
         class UnexpectedChat:
             def complete(self, messages):
@@ -268,6 +319,23 @@ class ServiceTests(unittest.TestCase):
         ]
         self.assertFalse(
             _has_relevant_evidence("What is the Bitcoin value today?", results)
+        )
+
+    def test_scoped_document_accepts_one_strong_subject_term(self):
+        results = [
+            SearchResult(
+                "cv.pdf",
+                6,
+                "Experience\nSoftware Development Intern",
+                0.40,
+            )
+        ]
+        self.assertTrue(
+            _has_relevant_evidence(
+                "work experience",
+                results,
+                allow_single_term=True,
+            )
         )
 
     def test_context_excerpt_removes_unrelated_sentences(self):
