@@ -1,0 +1,7 @@
+{
+  "dataset": "GXMZU/llm-rag-agent-papers",
+  "topic": "rag",
+  "requested": 20,
+  "downloaded": 20,
+  "source": "https://huggingface.co/datasets/GXMZU/llm-rag-agent-papers"
+}
