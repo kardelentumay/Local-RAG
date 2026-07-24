@@ -4,6 +4,7 @@ import hashlib
 import re
 from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .documents import chunk_text, discover_documents, read_document
@@ -126,16 +127,22 @@ class RAGService:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
         results = self.search(question, top_k)
-        if not results or max(item.score for item in results) < MIN_ANSWER_RELEVANCE:
+        relevance_results = [
+            SearchResult(
+                item.source,
+                item.position,
+                self.store.get_window(item.source, item.position, 1, 1),
+                item.score,
+            )
+            for item in results
+        ]
+        if not _has_relevant_evidence(question, relevance_results):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
             f"[{index}]\n{_context_excerpt(question, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
             for index, item in enumerate(results, start=1)
         )
-        prompt = (
-            f"BAĞLAM:\n{context}\n\nSORU:\n{question.strip()}\n\n"
-            "ÖNEMLİ: Yanıtı sorunun dilinde yaz ve bağlamda açıkça desteklenmeyen hiçbir ayrıntı ekleme."
-        )
+        prompt = _build_answer_prompt(question, context)
         text = self.chat.complete([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}])
         if _is_refusal(text.strip()):
             text = self.chat.complete(
@@ -154,6 +161,23 @@ class RAGService:
                     {
                         "role": "user",
                         "content": f"Aşağıdaki metnin tamamını yalnızca Türkçe yaz:\n\n{text.strip()}",
+                    },
+                ]
+            )
+        elif not _is_turkish(question) and _looks_turkish(text):
+            text = self.chat.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a translation editor. Translate the supplied answer completely "
+                            "into English. Do not add or remove information, and preserve the source "
+                            "numbers [1], [2], and [3] exactly."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Write the following text entirely in English:\n\n{text.strip()}",
                     },
                 ]
             )
@@ -180,6 +204,32 @@ def _looks_english(text: str) -> bool:
     english = sum(word in {"the", "and", "is", "are", "of", "to", "from", "with", "this", "that"} for word in words)
     turkish = sum(word in {"ve", "bir", "bu", "için", "ile", "olarak", "nedir", "olan"} for word in words)
     return english >= 3 and english > turkish * 2
+
+
+def _looks_turkish(text: str) -> bool:
+    lowered = text.lower()
+    turkish_characters = sum(lowered.count(character) for character in "çğıöşü")
+    words = re.findall(r"[^\W_]+", lowered, flags=re.UNICODE)
+    turkish_words = sum(
+        word in {"ve", "bir", "bu", "için", "ile", "olarak", "eğitimi", "gibi"}
+        for word in words
+    )
+    return turkish_characters >= 2 or turkish_words >= 3
+
+
+def _build_answer_prompt(question: str, context: str) -> str:
+    if _is_turkish(question):
+        return (
+            f"BAĞLAM:\n{context}\n\nSORU:\n{question.strip()}\n\n"
+            "ÖNEMLİ: Yanıtı yalnızca Türkçe yaz ve bağlamda açıkça desteklenmeyen "
+            "hiçbir ayrıntı ekleme."
+        )
+    return (
+        f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
+        "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
+        "the context. For list questions, reproduce the listed items concisely and "
+        "do not expand abbreviations or invent explanations."
+    )
 
 
 def _is_refusal(text: str) -> bool:
@@ -221,11 +271,11 @@ def _hybrid_fuse(
     semantic_scores = {
         (item.source, item.position): item.score for item in vector_results
     }
-    for result_list in (vector_results, keyword_results):
+    for result_list, weight in ((vector_results, 1.0), (keyword_results, 1.2)):
         for rank, item in enumerate(result_list, start=1):
             key = (item.source, item.position)
             items[key] = item
-            scores[key] = scores.get(key, 0.0) + 1.0 / (rank_constant + rank)
+            scores[key] = scores.get(key, 0.0) + weight / (rank_constant + rank)
 
     ranked = sorted(scores, key=scores.get, reverse=True)
     selected: list[SearchResult] = []
@@ -262,7 +312,7 @@ def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
         exact_matches = len(query_terms & sentence_terms)
         prefix_matches = sum(
             1 for query_term in query_terms
-            if any(term.startswith(query_term[:5]) or query_term.startswith(term[:5]) for term in sentence_terms)
+            if any(_terms_are_close(query_term, term) for term in sentence_terms)
         )
         ranked.append((exact_matches * 2 + prefix_matches, index, sentence))
     relevant = [item for item in sorted(ranked, key=lambda row: (-row[0], row[1])) if item[0] > 0]
@@ -285,6 +335,39 @@ def _meaningful_terms(text: str) -> set[str]:
         token for token in re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
         if len(token) >= 3 and token not in stopwords
     }
+
+
+def _has_relevant_evidence(question: str, results: list[SearchResult]) -> bool:
+    if not results:
+        return False
+    if max(item.score for item in results) >= MIN_ANSWER_RELEVANCE:
+        return True
+
+    query_terms = _meaningful_terms(question)
+    if len(query_terms) < 2:
+        return False
+    evidence_terms = _meaningful_terms(
+        " ".join(item.content for item in results)
+    )
+    matched_terms = {
+        query_term
+        for query_term in query_terms
+        if any(_terms_are_close(query_term, evidence_term) for evidence_term in evidence_terms)
+    }
+    distinctive_matches = sum(len(term) >= 6 for term in matched_terms)
+    return (
+        len(matched_terms) >= 2
+        and distinctive_matches >= 2
+        and len(matched_terms) / len(query_terms) >= 0.6
+    )
+
+
+def _terms_are_close(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 6:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= 0.86
 
 
 def _comparison_facets(question: str) -> list[str]:
