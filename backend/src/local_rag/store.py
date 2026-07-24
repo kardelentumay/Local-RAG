@@ -199,6 +199,29 @@ class SQLiteStore:
             ).fetchall()
         return "\n".join(row["content"] for row in rows)
 
+    def get_document_content(self, source: str) -> str:
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT content FROM chunks WHERE source = ? ORDER BY position",
+                (source,),
+            ).fetchall()
+        if not rows:
+            return ""
+
+        # Chunks overlap by design. Keeping the repeated text confuses small local
+        # chat models, so join them while removing the largest exact overlap.
+        combined = str(rows[0]["content"])
+        for row in rows[1:]:
+            content = str(row["content"])
+            overlap = 0
+            limit = min(len(combined), len(content), 300)
+            for size in range(limit, 19, -1):
+                if combined.endswith(content[:size]):
+                    overlap = size
+                    break
+            combined += content[overlap:]
+        return combined
+
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
     if len(left) != len(right):

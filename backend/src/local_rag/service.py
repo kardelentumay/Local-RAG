@@ -172,6 +172,25 @@ class RAGService:
             results = self._retrieve(retrieval_query, 40, expanded_top_k, use_scope=False)
         else:
             results = self.search(question, expanded_top_k)
+
+        structured = self._structured_document_answer(question, results)
+        if structured is not None:
+            return structured
+
+        if _is_project_list_question(question) and scope_term:
+            scoped_sources = _rarest_term_sources(
+                self.store, retrieval_query, max(top_k * 10, 20)
+            )
+            if scoped_sources:
+                project_section = _extract_section(
+                    self.store.get_document_content(scoped_sources[0]),
+                    "Projects",
+                    ("Experience", "Education", "Skills", "Certificates"),
+                )
+                if project_section:
+                    results = [
+                        SearchResult(scoped_sources[0], 0, project_section, 1.0)
+                    ]
         validation_query = _without_term(retrieval_query, scope_term)
         relevance_results = [
             SearchResult(
@@ -252,6 +271,72 @@ class RAGService:
         clean_answer = _validate_citations(clean_answer, len(results))
         return Answer(clean_answer, results)
 
+    def _structured_document_answer(
+        self, question: str, results: list[SearchResult]
+    ) -> Answer | None:
+        if not results:
+            return None
+
+        lowered_question = question.lower()
+        unique_results = list(
+            {
+                result.source: result
+                for result in results
+            }.values()
+        )
+
+        if _is_project_list_question(question):
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    "Projects",
+                    ("Experience", "Education", "Skills", "Certificates", "Sertificates"),
+                )
+                projects = _extract_projects(section)
+                if projects:
+                    bullets = "\n".join(
+                        f"- {name} — {description} [1]"
+                        for name, description in projects
+                    )
+                    return Answer(bullets, [result])
+
+        if "education" in lowered_question or "eğitim" in lowered_question:
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    "Education",
+                    ("Projects", "Experience", "Skills"),
+                )
+                education = _format_education(section)
+                if education:
+                    return Answer(f"{education} [1]", [result])
+
+        if "technolog" not in lowered_question:
+            return None
+
+        query_terms = _meaningful_terms(question)
+        candidates: list[tuple[int, SearchResult, str]] = []
+        for result in unique_results:
+            content = self.store.get_document_content(result.source)
+            for match in re.finditer(
+                r"(?im)^\s*Technologies\s*:\s*([^\r\n]+)", content
+            ):
+                nearby = content[max(0, match.start() - 900) : match.start()]
+                nearby_terms = _meaningful_terms(nearby)
+                score = sum(
+                    1
+                    for term in query_terms
+                    if any(_terms_are_close(term, item) for item in nearby_terms)
+                )
+                technologies = match.group(1).strip(" .")
+                candidates.append((score, result, technologies))
+        if not candidates:
+            return None
+        score, source, technologies = max(candidates, key=lambda item: item[0])
+        if score < 2:
+            return None
+        return Answer(f"{technologies}. [1]", [source])
+
 def _is_turkish(text: str) -> bool:
     lowered = text.lower()
     if any(character in lowered for character in "çğıöşü"):
@@ -327,6 +412,75 @@ def _normalize_retrieval_query(question: str) -> str:
 def _is_project_list_question(question: str) -> bool:
     lowered = question.lower()
     return "project" in lowered or "proje" in lowered
+
+
+def _extract_section(
+    content: str, heading: str, following_headings: tuple[str, ...]
+) -> str:
+    start_match = re.search(
+        rf"(?im)^\s*{re.escape(heading)}\s*$", content
+    )
+    if not start_match:
+        return ""
+    end = len(content)
+    remainder = content[start_match.end() :]
+    for candidate in following_headings:
+        match = re.search(
+            rf"(?im)^\s*{re.escape(candidate)}\s*$", remainder
+        )
+        if match:
+            end = min(end, start_match.end() + match.start())
+    return content[start_match.start() : end].strip()
+
+
+def _extract_projects(section: str) -> list[tuple[str, str]]:
+    if not section:
+        return []
+    lines = [
+        re.sub(r"\s+", " ", line).strip(" \t•")
+        for line in section.splitlines()
+    ]
+    lines = [line for line in lines if line and line.lower() != "projects"]
+    role_words = ("developer", "designer", "manager", "engineer")
+    projects: list[tuple[str, str]] = []
+    for index in range(len(lines) - 1):
+        name = lines[index]
+        role = lines[index + 1].lower()
+        if (
+            not any(word in role for word in role_words)
+            or name.lower().startswith(("technologies:", "kardelen tumay"))
+            or name.startswith("•")
+        ):
+            continue
+        description_parts: list[str] = []
+        for line in lines[index + 2 :]:
+            lowered = line.lower()
+            if lowered.startswith("technologies:") or line.startswith("•"):
+                break
+            description_parts.append(line)
+            if re.search(r"[.!?]$", line):
+                break
+        description = " ".join(description_parts)
+        description = re.sub(r"(?<=[a-z])- (?=[a-z])", "", description)
+        sentence = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0]
+        if sentence:
+            projects.append((name, sentence))
+    return projects
+
+
+def _format_education(section: str) -> str:
+    if not section:
+        return ""
+    lines = [
+        re.sub(r"\s+", " ", line).strip(" \t•")
+        for line in section.splitlines()
+    ]
+    lines = [line for line in lines if line and line.lower() != "education"]
+    if len(lines) < 2:
+        return ""
+    institution = lines[0]
+    program = lines[1]
+    return f"{institution} — {program}."
 
 
 def _has_named_anchor(question: str) -> bool:
