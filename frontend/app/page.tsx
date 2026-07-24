@@ -15,7 +15,7 @@ type DocumentResponse = {
   source: string;
   name: string;
   kind: string;
-  category: string;
+  category?: string;
   chunks: number;
   updated_at: string;
 };
@@ -92,12 +92,13 @@ function renderAnswerText(
 
 function toDocumentItem(document: DocumentResponse): DocumentItem {
   const kind = document.kind.toLowerCase();
+  const category = document.category?.trim() || "RAG Research";
   return {
     source: document.source,
     name: document.name,
     meta: `${document.chunks} ${document.chunks === 1 ? "chunk" : "chunks"}`,
     kind: kind === "pdf" || kind === "txt" ? kind : "md",
-    category: document.category,
+    category,
     active: true,
   };
 }
@@ -130,12 +131,13 @@ export default function Home() {
   const selectedSource = activeSources.find((source) => source.number === selectedSourceNumber) ?? null;
   const categories = Array.from(
     documents.reduce((groups, document) => {
-      const group = groups.get(document.category) ?? [];
+      const category = document.category?.trim() || "RAG Research";
+      const group = groups.get(category) ?? [];
       group.push(document);
-      groups.set(document.category, group);
+      groups.set(category, group);
       return groups;
     }, new Map<string, DocumentItem[]>())
-  ).sort(([left], [right]) => left.localeCompare(right));
+  ).sort(([left], [right]) => String(left).localeCompare(String(right)));
   const existingCategories = categories.map(([category]) => category);
 
   useEffect(() => {
@@ -231,7 +233,8 @@ export default function Home() {
         toDocumentItem(result),
         ...current.filter((document) => document.source !== result.source),
       ]);
-      setOpenCategories((current) => ({ ...current, [result.category]: true }));
+      const resultCategory = result.category?.trim() || "RAG Research";
+      setOpenCategories((current) => ({ ...current, [resultCategory]: true }));
       setNotice(`${result.name} was indexed locally in ${result.chunks} chunks.`);
     } catch (error) {
       setNotice(error instanceof Error ? `Upload failed: ${error.message}` : "Upload failed.");
