@@ -502,6 +502,15 @@ def _has_relevant_evidence(
         return True
 
     query_terms = _meaningful_terms(question)
+    if len(query_terms) == 1:
+        term = next(iter(query_terms))
+        evidence_terms = _meaningful_terms(
+            " ".join(item.content for item in results)
+        )
+        return (
+            any(_terms_are_close(term, evidence_term) for evidence_term in evidence_terms)
+            and max(item.score for item in results) >= 0.25
+        )
     if not query_terms or (len(query_terms) < 2 and not allow_single_term):
         return False
     evidence_terms = _meaningful_terms(
