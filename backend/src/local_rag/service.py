@@ -211,6 +211,20 @@ class RAGService:
                     },
                 ]
             )
+        if _is_project_list_question(question) and _needs_project_completion(text):
+            text = self.chat.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Extract the complete project list from the context. Return each "
+                            "project as one bullet: project name — one short description. "
+                            "Use only the context and include every project."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            )
         clean_answer = text.strip()
         if _is_refusal(clean_answer) or _has_degenerate_repetition(clean_answer):
             return Answer(_fallback_for(question), [])
@@ -258,8 +272,9 @@ def _build_answer_prompt(question: str, context: str) -> str:
         f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
         "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
         "the context. For list questions, extract every item under the relevant section "
-        "and return only short bullets; never stop after the first item. Do not expand "
-        "abbreviations or invent explanations."
+        "and return only short bullets; never stop after the first item. For project "
+        "lists, include each project name followed by one short supported description. "
+        "Do not expand abbreviations or invent explanations."
     )
 
 
@@ -280,6 +295,16 @@ def _normalize_retrieval_query(question: str) -> str:
         normalized = re.sub(pattern, " ", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized or question.strip()
+
+
+def _is_project_list_question(question: str) -> bool:
+    lowered = question.lower()
+    return "project" in lowered or "proje" in lowered
+
+
+def _needs_project_completion(text: str) -> bool:
+    lowered = text.lower()
+    return len(text.split()) < 18 or "http" not in lowered and "system" not in lowered
 
 
 def _is_refusal(text: str) -> bool:
@@ -430,13 +455,28 @@ def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
         r"[.!?]$", best_sentence
     ) and best_sentence[0].isupper() and "," not in best_sentence
     if is_heading:
-        chosen_indices = set(
-            range(best_index, min(len(sentences), best_index + 30))
-        )
+        end_index = min(len(sentences), best_index + 30)
+        for index in range(best_index + 1, end_index):
+            if _looks_like_section_heading(sentences[index]):
+                end_index = index
+                break
+        chosen_indices = set(range(best_index, end_index))
     else:
         chosen_indices = {index for _, index, _ in relevant[:3]}
     excerpt = " ".join(sentences[index] for index in sorted(chosen_indices))
     return excerpt[:max_chars]
+
+
+def _looks_like_section_heading(sentence: str) -> bool:
+    clean = sentence.strip(" \t•-*:#")
+    words = clean.split()
+    return (
+        bool(clean)
+        and len(clean) <= 40
+        and len(words) <= 4
+        and clean[0].isupper()
+        and not re.search(r"[.!?,;:/()-]", clean)
+    )
 
 
 def _meaningful_terms(text: str) -> set[str]:
