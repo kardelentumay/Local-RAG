@@ -156,7 +156,7 @@ class RAGService:
             SearchResult(
                 item.source,
                 item.position,
-                self.store.get_window(item.source, item.position, 1, 1),
+                self.store.get_window(item.source, item.position, 1, 2),
                 item.score,
             )
             for item in results
@@ -168,7 +168,7 @@ class RAGService:
         ):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
-            f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
+            f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 2), 1500 if scope_term else 1100)}"
             for index, item in enumerate(results, start=1)
         )
         prompt = _build_answer_prompt(question, context)
@@ -256,8 +256,8 @@ def _build_answer_prompt(question: str, context: str) -> str:
     return (
         f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
         "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
-        "the context. For list questions, reproduce the listed items concisely and "
-        "do not expand abbreviations or invent explanations."
+        "the context. For list questions, include every supported item as a short "
+        "bullet list, without omitting items, expanding abbreviations, or inventing explanations."
     )
 
 
@@ -429,7 +429,7 @@ def _context_excerpt(query: str, content: str, max_chars: int = 700) -> str:
     ) and best_sentence[0].isupper() and "," not in best_sentence
     if is_heading:
         chosen_indices = set(
-            range(best_index, min(len(sentences), best_index + 9))
+            range(best_index, min(len(sentences), best_index + 30))
         )
     else:
         chosen_indices = {index for _, index, _ in relevant[:3]}
