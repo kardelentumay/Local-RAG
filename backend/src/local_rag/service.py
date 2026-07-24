@@ -63,6 +63,7 @@ class RAGService:
         overlap: int = 100,
         batch_size: int = 16,
         source_root: Path | None = None,
+        category: str = "RAG Research",
     ) -> IngestReport:
         if batch_size < 1:
             raise ValueError("batch_size en az 1 olmalıdır")
@@ -81,7 +82,7 @@ class RAGService:
             vectors: list[list[float]] = []
             for start in range(0, len(chunks), batch_size):
                 vectors.extend(self.embeddings.embed([item.content for item in chunks[start : start + batch_size]]))
-            self.store.replace_document(source, digest, chunks, vectors)
+            self.store.replace_document(source, digest, chunks, vectors, category)
             processed += 1
             total_chunks += len(chunks)
         return IngestReport(processed, skipped, total_chunks)

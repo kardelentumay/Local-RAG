@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -68,6 +68,7 @@ class DocumentResponse(BaseModel):
     source: str
     name: str
     kind: str
+    category: str
     chunks: int
     updated_at: str
 
@@ -111,9 +112,13 @@ class LocalRAGRuntime:
     def list_documents(self) -> list[dict[str, object]]:
         return SQLiteStore(self.db_path).list_documents()
 
-    def ingest_document(self, path: Path) -> None:
+    def ingest_document(self, path: Path, category: str) -> None:
         with self._lock:
-            self._get_service().ingest(path, source_root=self.documents_path)
+            self._get_service().ingest(
+                path,
+                source_root=self.documents_path,
+                category=category,
+            )
 
     def delete_document(self, source: str) -> bool:
         with self._lock:
@@ -198,6 +203,7 @@ def _document_response(item: dict[str, object]) -> DocumentResponse:
         source=source,
         name=name,
         kind=suffix.upper() or "FILE",
+        category=str(item["category"]),
         chunks=int(item["chunks"]),
         updated_at=str(item["updated_at"]),
     )
@@ -214,7 +220,11 @@ async def documents() -> list[DocumentResponse]:
 
 
 @app.post("/api/documents", response_model=DocumentResponse, status_code=201)
-async def upload_document(file: UploadFile = File(...)) -> DocumentResponse:
+async def upload_document(
+    file: UploadFile = File(...),
+    category: str = Form(..., min_length=1, max_length=80),
+) -> DocumentResponse:
+    clean_category = _normalize_category(category)
     original_name = Path(file.filename or "").name
     suffix = Path(original_name).suffix.lower()
     if suffix not in ALLOWED_DOCUMENT_SUFFIXES:
@@ -243,7 +253,7 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentResponse:
                 destination.write(chunk)
         if size == 0:
             raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-        await asyncio.to_thread(runtime.ingest_document, target)
+        await asyncio.to_thread(runtime.ingest_document, target, clean_category)
         items = await asyncio.to_thread(runtime.list_documents)
         source = target.relative_to(runtime.documents_path.resolve()).as_posix()
         item = next(entry for entry in items if entry["source"] == source)
@@ -257,6 +267,13 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentResponse:
         raise HTTPException(status_code=500, detail="The document could not be indexed.") from exc
     finally:
         await file.close()
+
+
+def _normalize_category(category: str) -> str:
+    clean = " ".join(category.split())
+    if not clean or any(ord(character) < 32 for character in clean):
+        raise HTTPException(status_code=422, detail="Category name is invalid.")
+    return clean
 
 
 @app.delete("/api/documents/{source:path}", status_code=204)

@@ -35,6 +35,7 @@ class FakeRuntime:
         return [
             {
                 "source": "uploads/paper.md",
+                "category": "RAG Research",
                 "updated_at": "2026-07-24 10:00:00",
                 "chunks": 7,
             }
@@ -81,17 +82,23 @@ class APITests(unittest.TestCase):
         self.assertEqual(1, len(response))
         self.assertEqual("paper.md", response[0].name)
         self.assertEqual("MD", response[0].kind)
+        self.assertEqual("RAG Research", response[0].category)
         self.assertEqual(7, response[0].chunks)
 
     def test_uploaded_document_hides_storage_identifier(self):
         item = api._document_response(
             {
                 "source": "uploads/1234567890abcdef1234567890abcdef-notes.md",
+                "category": "Course Notes",
                 "updated_at": "2026-07-24 10:00:00",
                 "chunks": 1,
             }
         )
         self.assertEqual("notes.md", item.name)
+        self.assertEqual("Course Notes", item.category)
+
+    def test_category_name_is_normalized(self):
+        self.assertEqual("Course Notes", api._normalize_category("  Course   Notes  "))
 
     def test_delete_document_returns_not_found_for_unknown_source(self):
         with self.assertRaises(api.HTTPException) as context:

@@ -29,6 +29,7 @@ class SQLiteStore:
                 CREATE TABLE IF NOT EXISTS documents (
                     source TEXT PRIMARY KEY,
                     content_hash TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'RAG Research',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS chunks (
@@ -48,6 +49,14 @@ class SQLiteStore:
                 );
                 """
             )
+            document_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            if "category" not in document_columns:
+                db.execute(
+                    "ALTER TABLE documents ADD COLUMN category TEXT NOT NULL "
+                    "DEFAULT 'RAG Research'"
+                )
             chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             fts_count = db.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
             if chunk_count != fts_count:
@@ -62,13 +71,23 @@ class SQLiteStore:
             row = db.execute("SELECT 1 FROM documents WHERE source = ? AND content_hash = ?", (source, content_hash)).fetchone()
         return row is not None
 
-    def replace_document(self, source: str, content_hash: str, chunks: Sequence[Chunk], embeddings: Sequence[Sequence[float]]) -> None:
+    def replace_document(
+        self,
+        source: str,
+        content_hash: str,
+        chunks: Sequence[Chunk],
+        embeddings: Sequence[Sequence[float]],
+        category: str = "RAG Research",
+    ) -> None:
         if len(chunks) != len(embeddings):
             raise ValueError("Parça ve embedding sayıları eşit değil")
         with closing(self._connect()) as db, db:
             db.execute("DELETE FROM chunks_fts WHERE source = ?", (source,))
             db.execute("DELETE FROM documents WHERE source = ?", (source,))
-            db.execute("INSERT INTO documents(source, content_hash) VALUES (?, ?)", (source, content_hash))
+            db.execute(
+                "INSERT INTO documents(source, content_hash, category) VALUES (?, ?, ?)",
+                (source, content_hash, category),
+            )
             db.executemany(
                 "INSERT INTO chunks(source, position, content, embedding) VALUES (?, ?, ?, ?)",
                 [(item.source, item.position, item.content, json.dumps(list(vector))) for item, vector in zip(chunks, embeddings)],
@@ -98,14 +117,16 @@ class SQLiteStore:
     def list_documents(self) -> list[dict[str, object]]:
         with closing(self._connect()) as db:
             rows = db.execute(
-                "SELECT documents.source, documents.updated_at, COUNT(chunks.id) AS chunks "
+                "SELECT documents.source, documents.category, documents.updated_at, "
+                "COUNT(chunks.id) AS chunks "
                 "FROM documents LEFT JOIN chunks ON chunks.source = documents.source "
-                "GROUP BY documents.source, documents.updated_at "
-                "ORDER BY documents.updated_at DESC, documents.source"
+                "GROUP BY documents.source, documents.category, documents.updated_at "
+                "ORDER BY documents.category, documents.updated_at DESC, documents.source"
             ).fetchall()
         return [
             {
                 "source": row["source"],
+                "category": row["category"],
                 "updated_at": row["updated_at"],
                 "chunks": int(row["chunks"]),
             }

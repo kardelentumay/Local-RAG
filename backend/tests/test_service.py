@@ -75,10 +75,19 @@ class ServiceTests(unittest.TestCase):
         uploads.mkdir()
         uploaded = uploads / "notes.md"
         uploaded.write_text("RAG kaynaklarla yanıt üretir.", encoding="utf-8")
-        report = self.service.ingest(uploaded, source_root=self.docs)
+        report = self.service.ingest(
+            uploaded,
+            source_root=self.docs,
+            category="Course Notes",
+        )
         self.assertEqual(1, report.processed)
         sources = {item["source"] for item in self.store.list_documents()}
         self.assertIn("uploads/notes.md", sources)
+        uploaded_item = next(
+            item for item in self.store.list_documents()
+            if item["source"] == "uploads/notes.md"
+        )
+        self.assertEqual("Course Notes", uploaded_item["category"])
 
     def test_store_lists_and_deletes_document_with_chunks(self):
         self.service.ingest(self.docs, chunk_size=100, overlap=10)

@@ -7,6 +7,7 @@ type DocumentItem = {
   name: string;
   meta: string;
   kind: "pdf" | "md" | "txt";
+  category: string;
   active: boolean;
 };
 
@@ -14,6 +15,7 @@ type DocumentResponse = {
   source: string;
   name: string;
   kind: string;
+  category: string;
   chunks: number;
   updated_at: string;
 };
@@ -95,6 +97,7 @@ function toDocumentItem(document: DocumentResponse): DocumentItem {
     name: document.name,
     meta: `${document.chunks} ${document.chunks === 1 ? "chunk" : "chunks"}`,
     kind: kind === "pdf" || kind === "txt" ? kind : "md",
+    category: document.category,
     active: true,
   };
 }
@@ -115,11 +118,25 @@ export default function Home() {
   const [selectedLanguage, setSelectedLanguage] = useState("Auto-detect");
   const [openDropdown, setOpenDropdown] = useState<"model" | "language" | null>(null);
   const [answerLength, setAnswerLength] = useState("Normal");
-  const [documentsOpen, setDocumentsOpen] = useState(true);
+  const [openCategories, setOpenCategories] = useState<Record<string, boolean>>({
+    "RAG Research": true,
+  });
+  const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
+  const [categoryName, setCategoryName] = useState("RAG Research");
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadCategoryRef = useRef("RAG Research");
   const selectedSource = activeSources.find((source) => source.number === selectedSourceNumber) ?? null;
+  const categories = Array.from(
+    documents.reduce((groups, document) => {
+      const group = groups.get(document.category) ?? [];
+      group.push(document);
+      groups.set(document.category, group);
+      return groups;
+    }, new Map<string, DocumentItem[]>())
+  ).sort(([left], [right]) => left.localeCompare(right));
+  const existingCategories = categories.map(([category]) => category);
 
   useEffect(() => {
     let cancelled = false;
@@ -202,6 +219,7 @@ export default function Home() {
     setNotice(`Indexing ${file.name} locally…`);
     const body = new FormData();
     body.append("file", file);
+    body.append("category", uploadCategoryRef.current);
     try {
       const response = await fetch(`${API_BASE_URL}/api/documents`, { method: "POST", body });
       if (!response.ok) {
@@ -213,12 +231,23 @@ export default function Home() {
         toDocumentItem(result),
         ...current.filter((document) => document.source !== result.source),
       ]);
+      setOpenCategories((current) => ({ ...current, [result.category]: true }));
       setNotice(`${result.name} was indexed locally in ${result.chunks} chunks.`);
     } catch (error) {
       setNotice(error instanceof Error ? `Upload failed: ${error.message}` : "Upload failed.");
     } finally {
       setIsUploading(false);
     }
+  }
+
+  function chooseUploadCategory(event: FormEvent) {
+    event.preventDefault();
+    const cleanCategory = categoryName.trim().replace(/\s+/g, " ");
+    if (!cleanCategory) return;
+    uploadCategoryRef.current = cleanCategory;
+    setCategoryName(cleanCategory);
+    setCategoryDialogOpen(false);
+    fileInputRef.current?.click();
   }
 
   async function deleteDocument(document: DocumentItem) {
@@ -332,28 +361,43 @@ export default function Home() {
                 className="heading-upload"
                 aria-label="Add file"
                 disabled={isUploading}
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => {
+                  setCategoryName(existingCategories[0] ?? "RAG Research");
+                  setCategoryDialogOpen(true);
+                }}
               >
                 {isUploading ? "…" : "＋"}
               </button>
             </div>
 
-            <div className="collection-row">
-              <span><b>RAG Research</b><small>{documents.length} documents</small></span>
-              <button
-                className={`category-toggle ${documentsOpen ? "is-open" : ""}`}
-                type="button"
-                aria-label={documentsOpen ? "Collapse document category" : "Expand document category"}
-                aria-expanded={documentsOpen}
-                onClick={() => setDocumentsOpen((current) => !current)}
-              >
-                <img src="/category-dropdown.svg" alt="" />
-              </button>
-            </div>
+            <div className="document-groups">
+              {categories.map(([category, categoryDocuments]) => {
+                const isOpen = openCategories[category] ?? true;
+                return (
+                  <section className="document-category" key={category}>
+                    <div className="collection-row">
+                      <span>
+                        <b>{category}</b>
+                        <small>{categoryDocuments.length} {categoryDocuments.length === 1 ? "document" : "documents"}</small>
+                      </span>
+                      <button
+                        className={`category-toggle ${isOpen ? "is-open" : ""}`}
+                        type="button"
+                        aria-label={isOpen ? `Collapse ${category}` : `Expand ${category}`}
+                        aria-expanded={isOpen}
+                        onClick={() =>
+                          setOpenCategories((current) => ({
+                            ...current,
+                            [category]: !isOpen,
+                          }))
+                        }
+                      >
+                        <img src="/category-dropdown.svg" alt="" />
+                      </button>
+                    </div>
 
-            {documentsOpen && (
-              <div className="document-list">
-                {documents.map((document) => (
+                    {isOpen && <div className="document-list">
+                      {categoryDocuments.map((document) => (
                   <div className={`document-row ${document.active ? "is-active" : ""}`} key={document.source}>
                     <input
                       type="checkbox"
@@ -380,9 +424,12 @@ export default function Home() {
                       ×
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
+                      ))}
+                    </div>}
+                  </section>
+                );
+              })}
+            </div>
 
           </section>
         </aside>}
@@ -532,6 +579,43 @@ export default function Home() {
 
         </aside>}
       </div>
+
+      {categoryDialogOpen && (
+        <div className="modal-backdrop" onMouseDown={() => setCategoryDialogOpen(false)}>
+          <form
+            className="settings-modal category-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            onSubmit={chooseUploadCategory}
+            aria-modal="true"
+            role="dialog"
+            aria-label="Choose document category"
+          >
+            <div className="modal-heading">
+              <div><span className="eyebrow">Add document</span><h2>Choose a category</h2></div>
+              <button type="button" aria-label="Close category dialog" onClick={() => setCategoryDialogOpen(false)}>×</button>
+            </div>
+            <label className="settings-field">
+              <span>Category name</span>
+              <input
+                autoFocus
+                list="document-category-options"
+                maxLength={80}
+                value={categoryName}
+                onChange={(event) => setCategoryName(event.target.value)}
+                placeholder="e.g. Course Notes"
+              />
+            </label>
+            <datalist id="document-category-options">
+              {existingCategories.map((category) => <option value={category} key={category} />)}
+            </datalist>
+            <p className="category-help">Select an existing category or enter a new one.</p>
+            <div className="category-actions">
+              <button type="button" className="cancel-category" onClick={() => setCategoryDialogOpen(false)}>Cancel</button>
+              <button type="submit" className="save-settings" disabled={!categoryName.trim()}>Choose file</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modal-backdrop" onMouseDown={() => { setSettingsOpen(false); setOpenDropdown(null); }}>
