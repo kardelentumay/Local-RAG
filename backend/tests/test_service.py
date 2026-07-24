@@ -199,7 +199,29 @@ class ServiceTests(unittest.TestCase):
         ]
         results = _hybrid_fuse(vector, keyword, 2)
         self.assertEqual("shared.md", results[0].source)
-        self.assertGreater(results[0].score, results[1].score)
+        self.assertEqual(0.8, results[0].score)
+        self.assertEqual(0.9, results[1].score)
+
+    def test_hybrid_fusion_keeps_semantic_confidence_for_keyword_match(self):
+        vector = [
+            SearchResult("paper.md", 1, "Generic model value table.", 0.21),
+        ]
+        keyword = [
+            SearchResult("paper.md", 1, "Generic model value table.", 9.0),
+        ]
+        results = _hybrid_fuse(vector, keyword, 1)
+        self.assertEqual(0.21, results[0].score)
+
+    def test_off_topic_question_is_rejected_before_chat_generation(self):
+        class UnexpectedChat:
+            def complete(self, messages):
+                raise AssertionError("Chat generation must not run for an unrelated question.")
+
+        service = RAGService(self.store, KeywordEmbeddings(), UnexpectedChat())
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("What is the Bitcoin value today?", 2)
+        self.assertEqual(FALLBACK_ANSWER_EN, answer.text)
+        self.assertEqual([], answer.sources)
 
     def test_context_excerpt_removes_unrelated_sentences(self):
         content = (

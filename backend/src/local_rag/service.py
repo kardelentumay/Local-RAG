@@ -217,13 +217,15 @@ def _hybrid_fuse(
 ) -> list[SearchResult]:
     scores: dict[tuple[str, int], float] = {}
     items: dict[tuple[str, int], SearchResult] = {}
+    semantic_scores = {
+        (item.source, item.position): item.score for item in vector_results
+    }
     for result_list in (vector_results, keyword_results):
         for rank, item in enumerate(result_list, start=1):
             key = (item.source, item.position)
             items[key] = item
             scores[key] = scores.get(key, 0.0) + 1.0 / (rank_constant + rank)
 
-    max_score = 2.0 / (rank_constant + 1)
     ranked = sorted(scores, key=scores.get, reverse=True)
     selected: list[SearchResult] = []
     source_counts: dict[str, int] = {}
@@ -232,7 +234,12 @@ def _hybrid_fuse(
         if source_counts.get(item.source, 0) >= 2:
             continue
         selected.append(
-            SearchResult(item.source, item.position, item.content, min(scores[key] / max_score, 1.0))
+            SearchResult(
+                item.source,
+                item.position,
+                item.content,
+                semantic_scores.get(key, 0.0),
+            )
         )
         source_counts[item.source] = source_counts.get(item.source, 0) + 1
         if len(selected) == top_k:
