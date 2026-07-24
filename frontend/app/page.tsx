@@ -522,9 +522,6 @@ export default function Home() {
                     <i><em style={{ width: `${Math.round(selectedSource.score * 100)}%` }} /></i>
                   </div>
                   <blockquote>{selectedSource.content}</blockquote>
-                  <button className="open-source" onClick={() => setNotice("Document preview will be connected in the upload phase.")}>
-                    View in document ↗
-                  </button>
                 </article>
               )}
             </>
