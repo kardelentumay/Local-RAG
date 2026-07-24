@@ -147,10 +147,11 @@ class RAGService:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
         retrieval_query = _normalize_retrieval_query(question)
-        results = self.search(question, top_k)
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
+        expanded_top_k = max(top_k, 6) if scope_term and top_k > 1 else top_k
+        results = self.search(question, expanded_top_k)
         validation_query = _without_term(retrieval_query, scope_term)
         relevance_results = [
             SearchResult(
@@ -256,8 +257,9 @@ def _build_answer_prompt(question: str, context: str) -> str:
     return (
         f"CONTEXT:\n{context}\n\nQUESTION:\n{question.strip()}\n\n"
         "IMPORTANT: Answer only in English. Use only facts explicitly supported by "
-        "the context. For list questions, include every supported item as a short "
-        "bullet list, without omitting items, expanding abbreviations, or inventing explanations."
+        "the context. For list questions, extract every item under the relevant section "
+        "and return only short bullets; never stop after the first item. Do not expand "
+        "abbreviations or invent explanations."
     )
 
 
