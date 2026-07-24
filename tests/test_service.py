@@ -1,0 +1,282 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from local_rag.models import SearchResult
+from local_rag.service import (
+    FALLBACK_ANSWER_EN,
+    FALLBACK_ANSWER_TR,
+    RAGService,
+    _comparison_facets,
+    _context_excerpt,
+    _hybrid_fuse,
+    _validate_citations,
+)
+from local_rag.store import SQLiteStore
+
+
+class KeywordEmbeddings:
+    words = ("saat", "bilgisayar", "rag", "kaynak")
+
+    def embed(self, texts):
+        vectors = []
+        for text in texts:
+            lowered = text.lower()
+            vector = [float(lowered.count(word)) for word in self.words]
+            if not any(vector):
+                vector.append(1.0)
+            else:
+                vector.append(0.0)
+            vectors.append(vector)
+        return vectors
+
+
+class RecordingChat:
+    def __init__(self):
+        self.messages = None
+
+    def complete(self, messages):
+        self.messages = messages
+        return "Dersler 09.00'da başlar [1]."
+
+
+class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.docs = root / "docs"
+        self.docs.mkdir()
+        (self.docs / "program.md").write_text(
+            "Dersler hafta içi saat 09.00'da başlar.\n\nKatılımcılar bilgisayar getirmelidir.\n\nRAG cevapları kaynaklara dayanır.",
+            encoding="utf-8",
+        )
+        self.store = SQLiteStore(root / "knowledge.db")
+        self.chat = RecordingChat()
+        self.service = RAGService(self.store, KeywordEmbeddings(), self.chat)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_ingest_is_idempotent_and_searches(self):
+        first = self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        second = self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        self.assertEqual(1, first.processed)
+        self.assertGreater(first.chunks, 0)
+        self.assertEqual(1, second.skipped)
+        self.assertEqual("program.md", self.service.search("saat kaçta?", 1)[0].source)
+
+    def test_changed_chunk_settings_force_reindex(self):
+        first = self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        changed = self.service.ingest(self.docs, chunk_size=120, overlap=20)
+        self.assertEqual(1, first.processed)
+        self.assertEqual(1, changed.processed)
+
+    def test_fts_keyword_search_finds_ingested_content(self):
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        results = self.store.keyword_search("bilgisayar", 5)
+        self.assertTrue(results)
+        self.assertEqual("program.md", results[0].source)
+
+    def test_store_returns_previous_chunk_window(self):
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        window = self.store.get_window("program.md", 1, before=1)
+        self.assertIn("Dersler", window)
+        self.assertIn("bilgisayar", window)
+
+    def test_comparison_question_is_split_into_two_retrieval_facets(self):
+        facets = _comparison_facets("What is the difference between RAGAS and corrective RAG?")
+        self.assertEqual(["RAGAS", "corrective RAG"], facets)
+
+    def test_answer_includes_retrieved_context(self):
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = self.service.answer("Dersler saat kaçta?", 1)
+        self.assertIn("[1]", answer.text)
+        self.assertIn("BAĞLAM", self.chat.messages[1]["content"])
+        self.assertNotIn("Kaynak:", self.chat.messages[1]["content"])
+        self.assertEqual(1, len(answer.sources))
+
+    def test_search_adds_qwen_retrieval_instruction(self):
+        class RecordingEmbeddings(KeywordEmbeddings):
+            def __init__(self):
+                self.last_text = ""
+
+            def embed(self, texts):
+                self.last_text = texts[0]
+                return super().embed(texts)
+
+        embeddings = RecordingEmbeddings()
+        service = RAGService(self.store, embeddings, self.chat)
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        service.search("RAG nedir?", 1)
+        self.assertIn("Instruct:", embeddings.last_text)
+        self.assertIn("Query: RAG nedir?", embeddings.last_text)
+
+    def test_english_answer_to_turkish_question_is_translated(self):
+        class TranslatingChat:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return "The retrieval module is connected to the generation module with context."
+                return "Retrieval modülü, bağlam aracılığıyla üretim modülüne bağlanır."
+
+        chat = TranslatingChat()
+        service = RAGService(self.store, KeywordEmbeddings(), chat)
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("RAG nedir ve nasıl çalışır?", 1)
+        self.assertEqual(2, chat.calls)
+        self.assertIn("üretim", answer.text)
+
+    def test_apology_refusal_is_normalized_and_sources_hidden(self):
+        class RefusingChat:
+            def complete(self, messages):
+                return "Bağlamın desteklemediği için özür dilerim. Başka bir konuda yardımcı olabilirim."
+
+        service = RAGService(self.store, KeywordEmbeddings(), RefusingChat())
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("RAG nedir?", 1)
+        self.assertEqual(FALLBACK_ANSWER_TR, answer.text)
+        self.assertEqual([], answer.sources)
+
+    def test_refusal_is_retried_once_with_grounded_prompt(self):
+        class RetryChat:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return FALLBACK_ANSWER_EN
+                return "RAG combines retrieval with generation [1]."
+
+        chat = RetryChat()
+        service = RAGService(self.store, KeywordEmbeddings(), chat)
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("What is RAG?", 1)
+        self.assertEqual(2, chat.calls)
+        self.assertIn("combines retrieval", answer.text)
+        self.assertEqual(1, len(answer.sources))
+
+    def test_weak_single_channel_results_are_rejected_before_generation(self):
+        class WeakEvidenceService(RAGService):
+            def search(self, question, top_k=3):
+                return [SearchResult("unrelated.md", 1, "Unrelated content", 0.5)]
+
+        chat = RecordingChat()
+        service = WeakEvidenceService(self.store, KeywordEmbeddings(), chat)
+        answer = service.answer("What is the price of Bitcoin today?", 2)
+        self.assertEqual(FALLBACK_ANSWER_EN, answer.text)
+        self.assertEqual([], answer.sources)
+        self.assertIsNone(chat.messages)
+
+    def test_english_fallback_does_not_receive_citation(self):
+        class EnglishRefusingChat:
+            def complete(self, messages):
+                return "No relevant information was found in the loaded documents."
+
+        service = RAGService(self.store, KeywordEmbeddings(), EnglishRefusingChat())
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("What is quantum computing?", 1)
+        self.assertEqual(FALLBACK_ANSWER_EN, answer.text)
+        self.assertEqual([], answer.sources)
+
+    def test_context_excerpt_selects_query_relevant_sentences(self):
+        content = (
+            "RAG is used in many applications. "
+            "Standard RAG has limited contextual awareness and can produce fragmented outputs. "
+            "Static workflows struggle with multi-step reasoning, scalability, and latency. "
+            "Future work includes virtual reality."
+        )
+        excerpt = _context_excerpt("What are the limitations of standard RAG systems?", content)
+        self.assertIn("fragmented outputs", excerpt)
+        self.assertNotIn("virtual reality", excerpt)
+
+    def test_repetitive_answer_is_rejected(self):
+        class RepeatingChat:
+            def complete(self, messages):
+                return "Açıklama " + "genellikle " * 30
+
+        service = RAGService(self.store, KeywordEmbeddings(), RepeatingChat())
+        service.ingest(self.docs, chunk_size=100, overlap=10)
+        answer = service.answer("RAG nedir?", 1)
+        self.assertEqual(FALLBACK_ANSWER_TR, answer.text)
+        self.assertEqual([], answer.sources)
+
+    def test_hybrid_fusion_rewards_results_found_by_both_retrievers(self):
+        vector = [
+            SearchResult("vector-only.md", 1, "Vector result", 0.9),
+            SearchResult("shared.md", 2, "Shared result", 0.8),
+        ]
+        keyword = [
+            SearchResult("shared.md", 2, "Shared result", 2.0),
+            SearchResult("keyword-only.md", 3, "Keyword result", 1.0),
+        ]
+        results = _hybrid_fuse(vector, keyword, 2)
+        self.assertEqual("shared.md", results[0].source)
+        self.assertGreater(results[0].score, results[1].score)
+
+    def test_context_excerpt_removes_unrelated_sentences(self):
+        content = (
+            "Brain-computer interfaces enable immersive applications. "
+            "Incorrect retrieved knowledge can cause hallucinations in RAG systems. "
+            "Corrective retrieval improves grounding and factuality. "
+            "Virtual reality is another future research direction."
+        )
+        excerpt = _context_excerpt("How can hallucinations be reduced?", content)
+        self.assertIn("cause hallucinations", excerpt)
+        self.assertNotIn("Brain-computer", excerpt)
+
+    def test_context_excerpt_selects_agentic_comparison_sentences(self):
+        content = (
+            "RAG is used in many industries. "
+            "Traditional RAG systems use static workflows and have limited adaptability. "
+            "Unlike traditional RAG, Agentic RAG uses autonomous agents, adaptive retrieval, and iterative refinement. "
+            "Healthcare is one possible application."
+        )
+        excerpt = _context_excerpt("How does agentic RAG differ from traditional RAG?", content)
+        self.assertIn("static workflows", excerpt)
+        self.assertIn("autonomous agents", excerpt)
+        self.assertNotIn("Healthcare", excerpt)
+
+    def test_context_excerpt_keeps_explanation_after_matching_heading(self):
+        content = (
+            "Parametric and non-parametric memory. "
+            "The parametric memory is a pretrained sequence-to-sequence model. "
+            "The non-parametric memory is a dense vector index accessed by a retriever. "
+            "Together they support knowledge-intensive generation."
+        )
+        excerpt = _context_excerpt("What is the difference between parametric and non-parametric memory?", content)
+        self.assertIn("sequence-to-sequence", excerpt)
+        self.assertIn("dense vector index", excerpt)
+
+    def test_citation_validator_removes_out_of_range_numbers(self):
+        answer = _validate_citations("First claim [1]. Invalid claim [3]. Second [2].", 2)
+        self.assertIn("[1]", answer)
+        self.assertIn("[2]", answer)
+        self.assertNotIn("[3]", answer)
+
+    def test_citation_validator_adds_first_source_when_missing(self):
+        answer = _validate_citations("A grounded answer.", 2)
+        self.assertEqual("A grounded answer. [1]", answer)
+
+    def test_citation_validator_removes_all_citations_without_sources(self):
+        answer = _validate_citations("Unsupported [1] statement.", 0)
+        self.assertEqual("Unsupported statement.", answer)
+
+    def test_citation_validator_collapses_repeated_citations(self):
+        answer = _validate_citations("A claim [1] [1] [1] [1] [", 2)
+        self.assertEqual("A claim [1]", answer)
+
+    def test_citation_validator_removes_standalone_leading_citation(self):
+        answer = _validate_citations("[1]\nA grounded comparison. [1]", 1)
+        self.assertEqual("A grounded comparison. [1]", answer)
+
+    def test_citation_validator_removes_standalone_citation_inside_answer(self):
+        answer = _validate_citations("First paragraph.\n\n[2]\nSecond paragraph. [1] [2]", 2)
+        self.assertEqual("First paragraph.\nSecond paragraph. [1] [2]", answer)
+
+
+if __name__ == "__main__":
+    unittest.main()
