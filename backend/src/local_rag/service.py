@@ -92,8 +92,9 @@ class RAGService:
         clean = question.strip()
         if not clean:
             raise ValueError("Soru boş olamaz")
+        retrieval_query = _normalize_retrieval_query(clean)
         candidate_count = max(top_k * 10, 20)
-        results = self._retrieve(clean, candidate_count, top_k)
+        results = self._retrieve(retrieval_query, candidate_count, top_k)
         facets = _comparison_facets(clean)
         if len(facets) != 2 or top_k < 2:
             return results
@@ -126,6 +127,7 @@ class RAGService:
     def answer(self, question: str, top_k: int = 3) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
+        retrieval_query = _normalize_retrieval_query(question)
         results = self.search(question, top_k)
         relevance_results = [
             SearchResult(
@@ -136,10 +138,10 @@ class RAGService:
             )
             for item in results
         ]
-        if not _has_relevant_evidence(question, relevance_results):
+        if not _has_relevant_evidence(retrieval_query, relevance_results):
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
-            f"[{index}]\n{_context_excerpt(question, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
+            f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 1), 1100)}"
             for index, item in enumerate(results, start=1)
         )
         prompt = _build_answer_prompt(question, context)
@@ -230,6 +232,25 @@ def _build_answer_prompt(question: str, context: str) -> str:
         "the context. For list questions, reproduce the listed items concisely and "
         "do not expand abbreviations or invent explanations."
     )
+
+
+def _normalize_retrieval_query(question: str) -> str:
+    normalized = question.strip()
+    typo_corrections = {
+        r"\bsertificates?\b": "certificates",
+        r"\bcertificats?\b": "certificates",
+    }
+    for pattern, replacement in typo_corrections.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    filler_patterns = (
+        r"^\s*(?:please\s+)?(?:give|show|tell)\s+me\s+(?:the\s+)?",
+        r"\b(?:the\s+)?information\s+about\b",
+        r"\b(?:the\s+)?details\s+about\b",
+    )
+    for pattern in filler_patterns:
+        normalized = re.sub(pattern, " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized or question.strip()
 
 
 def _is_refusal(text: str) -> bool:

@@ -11,6 +11,7 @@ from local_rag.service import (
     _build_answer_prompt,
     _has_relevant_evidence,
     _hybrid_fuse,
+    _normalize_retrieval_query,
     _validate_citations,
 )
 from local_rag.store import SQLiteStore
@@ -310,6 +311,20 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("QUESTION:", prompt)
         self.assertIn("Answer only in English", prompt)
         self.assertNotIn("BAĞLAM", prompt)
+
+    def test_retrieval_query_corrects_certificate_typo(self):
+        self.assertEqual(
+            "what are the certificates of Kardelen",
+            _normalize_retrieval_query("what are the sertificates of Kardelen"),
+        )
+
+    def test_retrieval_query_removes_conversational_filler(self):
+        self.assertEqual(
+            "education kardelen",
+            _normalize_retrieval_query(
+                "Give me the education information about kardelen"
+            ),
+        )
 
     def test_citation_validator_removes_out_of_range_numbers(self):
         answer = _validate_citations("First claim [1]. Invalid claim [3]. Second [2].", 2)
