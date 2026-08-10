@@ -30,6 +30,7 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 ALLOWED_ORIGINS = (
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "nivora://app",
 )
 
 
@@ -327,9 +328,10 @@ def run() -> None:
     import uvicorn
 
     uvicorn.run(
-        "local_rag.api:app",
+        app,
         host="127.0.0.1",
         port=8000,
         reload=False,
         access_log=False,
+        log_config=None,
     )

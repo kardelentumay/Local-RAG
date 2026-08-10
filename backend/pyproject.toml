@@ -17,6 +17,11 @@ dependencies = [
   "foundry-local-sdk>=1.0; platform_system != 'Windows'",
 ]
 
+[project.optional-dependencies]
+desktop = [
+  "pyinstaller>=6.0,<7.0",
+]
+
 [project.scripts]
 local-rag = "local_rag.cli:main"
 local-rag-api = "local_rag.api:run"
