@@ -201,6 +201,7 @@ body {
 .file-type.pdf { color: #8e3e58; background: #f9e8e8; }
 .file-type.md { color: #69418a; background: #efe7f5; }
 .file-type.txt { color: #355c94; background: #e8eef8; }
+.file-type.xlsx { color: #217346; background: #e5f3eb; }
 .file-input { display: none; }
 .heading-upload:disabled { cursor: wait; opacity: .55; }
 .ready-dot { width: 7px; height: 7px; border-radius: 50%; background: #c9c6d0; }

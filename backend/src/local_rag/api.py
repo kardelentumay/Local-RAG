@@ -25,7 +25,7 @@ DEFAULT_DB_PATH = Path("data/knowledge.db")
 DEFAULT_EMBEDDING_MODEL = "qwen3-embedding-0.6b"
 DEFAULT_CHAT_MODEL = "qwen2.5-1.5b"
 DEFAULT_DOCUMENTS_PATH = Path("documents")
-ALLOWED_DOCUMENT_SUFFIXES = {".pdf", ".md", ".txt"}
+ALLOWED_DOCUMENT_SUFFIXES = {".pdf", ".md", ".txt", ".xlsx"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 ALLOWED_ORIGINS = (
     "http://localhost:3000",
@@ -233,7 +233,7 @@ async def upload_document(
     if suffix not in ALLOWED_DOCUMENT_SUFFIXES:
         raise HTTPException(
             status_code=415,
-            detail="Only PDF, Markdown, and plain-text files are supported.",
+            detail="Only PDF, Excel, Markdown, and plain-text files are supported.",
         )
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip(".-_")
     safe_name = f"{safe_stem or 'document'}{suffix}"

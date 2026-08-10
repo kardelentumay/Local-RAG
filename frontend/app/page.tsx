@@ -6,7 +6,7 @@ type DocumentItem = {
   source: string;
   name: string;
   meta: string;
-  kind: "pdf" | "md" | "txt";
+  kind: "pdf" | "md" | "txt" | "xlsx";
   category: string;
   active: boolean;
 };
@@ -97,7 +97,7 @@ function toDocumentItem(document: DocumentResponse): DocumentItem {
     source: document.source,
     name: document.name,
     meta: `${document.chunks} ${document.chunks === 1 ? "chunk" : "chunks"}`,
-    kind: kind === "pdf" || kind === "txt" ? kind : "md",
+    kind: kind === "pdf" || kind === "txt" || kind === "xlsx" ? kind : "md",
     category,
     active: true,
   };
@@ -364,7 +364,7 @@ export default function Home() {
                 ref={fileInputRef}
                 className="file-input"
                 type="file"
-                accept=".pdf,.md,.txt"
+                accept=".pdf,.md,.txt,.xlsx"
                 onChange={uploadDocument}
               />
               <button
