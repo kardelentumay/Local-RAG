@@ -83,7 +83,10 @@ body {
   grid-template-columns: minmax(0, 1fr) 42px;
   grid-template-rows: minmax(220px, 36%) minmax(0, 64%); padding: 0;
 }
-.source-panel { position: relative; border-left: 1px solid var(--line); padding: 22px 18px 22px 52px; }
+.source-panel {
+  position: relative; border-left: 1px solid var(--line); padding: 22px 18px 22px 52px;
+  display: flex; flex-direction: column; overflow: hidden;
+}
 .chat-panel { position: relative; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: #faf9fb; }
 .sidebar-toggle {
   position: absolute; z-index: 5; display: grid; place-items: center; width: 30px; height: 36px; padding: 7px;
@@ -285,6 +288,13 @@ body {
 .demo-notice button { border: 0; background: transparent; color: var(--navy); }
 
 .source-heading { margin-bottom: 18px; }
+.source-content {
+  flex: 1; min-height: 0; overflow-y: auto; padding-right: 5px;
+  scrollbar-width: thin; scrollbar-color: var(--lavender) transparent;
+}
+.source-content::-webkit-scrollbar { width: 5px; }
+.source-content::-webkit-scrollbar-thumb { background: var(--lavender); border-radius: 99px; }
+.source-content::-webkit-scrollbar-track { background: transparent; }
 .source-count { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--soft-purple); color: var(--purple); font-size: 12px; font-weight: 800; }
 .source-tabs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line); }
 .source-tabs button { border: 0; border-bottom: 2px solid transparent; padding: 10px; background: transparent; color: var(--muted); font-size: 11px; }

@@ -582,6 +582,7 @@ export default function Home() {
             <span className="source-count">{activeSources.length}</span>
           </div>
 
+          <div className="source-content">
           {activeSources.length > 0 ? (
             <>
               <div className="source-tabs" style={{ gridTemplateColumns: `repeat(${activeSources.length}, 1fr)` }}>
@@ -616,6 +617,7 @@ export default function Home() {
               <p>Ask a question and open a citation to inspect its supporting document passage.</p>
             </div>
           )}
+          </div>
 
         </aside>}
       </div>
