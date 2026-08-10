@@ -8,6 +8,7 @@ from local_rag.service import (
     FALLBACK_ANSWER_TR,
     RAGService,
     _context_excerpt,
+    _extract_spreadsheet_summary,
     _build_answer_prompt,
     _has_relevant_evidence,
     _hybrid_fuse,
@@ -433,6 +434,24 @@ class ServiceTests(unittest.TestCase):
     def test_citation_validator_removes_standalone_citation_inside_answer(self):
         answer = _validate_citations("First paragraph.\n\n[2]\nSecond paragraph. [1] [2]", 2)
         self.assertEqual("First paragraph.\nSecond paragraph. [1] [2]", answer)
+
+    def test_spreadsheet_summary_matches_units_sold(self):
+        content = (
+            "[Çalışma Sayfası: Analysis]\n"
+            "A4=Total Revenue | B4=3795460\n"
+            "A6=Total Units Sold | B6=748"
+        )
+        answer = _extract_spreadsheet_summary(
+            "How many units were sold?", content
+        )
+        self.assertEqual("Total Units Sold: 748.", answer)
+
+    def test_spreadsheet_summary_formats_margin_as_percentage(self):
+        content = "A7=Overall Profit Margin | B7=0.2791888203"
+        answer = _extract_spreadsheet_summary(
+            "What is the overall profit margin?", content
+        )
+        self.assertEqual("Overall Profit Margin: 27.9%.", answer)
 
 
 if __name__ == "__main__":

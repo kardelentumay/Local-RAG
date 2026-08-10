@@ -324,6 +324,15 @@ class RAGService:
             }.values()
         )
 
+        for result in unique_results:
+            if Path(result.source).suffix.lower() != ".xlsx":
+                continue
+            summary_answer = _extract_spreadsheet_summary(
+                question, self.store.get_document_content(result.source)
+            )
+            if summary_answer:
+                return Answer(f"{summary_answer} [1]", [result])
+
         if _is_project_list_question(question):
             for result in unique_results:
                 section = _extract_section(
@@ -546,6 +555,67 @@ def _format_education(section: str) -> str:
     institution = lines[0]
     program = lines[1]
     return f"{institution} — {program}."
+
+
+def _extract_spreadsheet_summary(question: str, content: str) -> str:
+    query_terms = _meaningful_terms(question) - {"many", "much"}
+    if not query_terms:
+        return ""
+
+    candidates: list[tuple[int, float, str, str]] = []
+    for line in content.splitlines():
+        cells = re.findall(
+            r"([A-Z]+)(\d+)=([^|]+?)(?=\s*\|\s*[A-Z]+\d+=|$)", line
+        )
+        for index, (column, row, raw_label) in enumerate(cells[:-1]):
+            next_column, next_row, raw_value = cells[index + 1]
+            if row != next_row or _column_number(next_column) != _column_number(column) + 1:
+                continue
+            label = raw_label.strip()
+            value = raw_value.strip()
+            if not _is_number(value):
+                continue
+            label_terms = _meaningful_terms(label)
+            matched = sum(
+                1
+                for query_term in query_terms
+                if any(_terms_are_close(query_term, label_term) for label_term in label_terms)
+            )
+            if matched:
+                candidates.append((matched, matched / len(query_terms), label, value))
+
+    if not candidates:
+        return ""
+    matched, coverage, label, value = max(
+        candidates, key=lambda item: (item[0], item[1], len(item[2]))
+    )
+    if matched < 2 and coverage < 1.0:
+        return ""
+    return f"{label}: {_format_summary_number(label, value)}."
+
+
+def _column_number(column: str) -> int:
+    number = 0
+    for character in column:
+        number = number * 26 + ord(character) - ord("A") + 1
+    return number
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value.replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+
+def _format_summary_number(label: str, value: str) -> str:
+    number = float(value.replace(",", ""))
+    if "margin" in label.lower() and abs(number) <= 1:
+        return f"{number:.1%}"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
 def _has_named_anchor(question: str) -> bool:
