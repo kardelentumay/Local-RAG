@@ -25,11 +25,12 @@ DEFAULT_DB_PATH = Path("data/knowledge.db")
 DEFAULT_EMBEDDING_MODEL = "qwen3-embedding-0.6b"
 DEFAULT_CHAT_MODEL = "qwen2.5-1.5b"
 DEFAULT_DOCUMENTS_PATH = Path("documents")
-ALLOWED_DOCUMENT_SUFFIXES = {".pdf", ".md", ".txt"}
+ALLOWED_DOCUMENT_SUFFIXES = {".pdf", ".md", ".txt", ".xlsx"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 ALLOWED_ORIGINS = (
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "nivora://app",
 )
 
 
@@ -37,6 +38,9 @@ class HealthResponse(BaseModel):
     status: str
     mode: str
     models_loaded: bool
+    application: str
+    instance_token: str
+    pid: int
 
 
 class StatusResponse(BaseModel):
@@ -49,6 +53,7 @@ class StatusResponse(BaseModel):
 class AskRequest(BaseModel):
     question: Annotated[str, Field(min_length=1, max_length=4000)]
     top_k: Annotated[int, Field(ge=1, le=5)] = 2
+    sources: list[str] | None = None
 
 
 class SourceResponse(BaseModel):
@@ -104,10 +109,12 @@ class LocalRAGRuntime:
     def stats(self) -> tuple[int, int]:
         return SQLiteStore(self.db_path).stats()
 
-    def ask(self, question: str, top_k: int) -> Answer:
+    def ask(
+        self, question: str, top_k: int, sources: list[str] | None = None
+    ) -> Answer:
         with self._lock:
             service = self._get_service()
-            return service.answer(question, top_k)
+            return service.answer(question, top_k, sources)
 
     def list_documents(self) -> list[dict[str, object]]:
         return SQLiteStore(self.db_path).list_documents()
@@ -175,7 +182,14 @@ app.add_middleware(
 
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", mode="local", models_loaded=runtime.models_loaded)
+    return HealthResponse(
+        status="ok",
+        mode="local",
+        models_loaded=runtime.models_loaded,
+        application="nivora-local-rag",
+        instance_token=os.environ.get("LOCAL_RAG_INSTANCE_TOKEN", ""),
+        pid=os.getpid(),
+    )
 
 
 @app.get("/api/status", response_model=StatusResponse)
@@ -230,7 +244,7 @@ async def upload_document(
     if suffix not in ALLOWED_DOCUMENT_SUFFIXES:
         raise HTTPException(
             status_code=415,
-            detail="Only PDF, Markdown, and plain-text files are supported.",
+            detail="Only PDF, Excel, Markdown, and plain-text files are supported.",
         )
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip(".-_")
     safe_name = f"{safe_stem or 'document'}{suffix}"
@@ -298,7 +312,9 @@ async def ask(request: AskRequest) -> AskResponse:
     if not question:
         raise HTTPException(status_code=422, detail="Question cannot be blank.")
     try:
-        answer = await asyncio.to_thread(runtime.ask, question, request.top_k)
+        answer = await asyncio.to_thread(
+            runtime.ask, question, request.top_k, request.sources
+        )
     except (RuntimeError, ValueError) as exc:
         LOGGER.exception("Local model inference failed.")
         raise HTTPException(
@@ -310,7 +326,7 @@ async def ask(request: AskRequest) -> AskResponse:
             number=index,
             document=item.source,
             chunk=item.position + 1,
-            score=round(item.score, 4),
+            score=round(max(0.0, min(1.0, item.score)), 4),
             content=item.content,
         )
         for index, item in enumerate(answer.sources, start=1)
@@ -322,9 +338,10 @@ def run() -> None:
     import uvicorn
 
     uvicorn.run(
-        "local_rag.api:app",
+        app,
         host="127.0.0.1",
         port=8000,
         reload=False,
         access_log=False,
+        log_config=None,
     )

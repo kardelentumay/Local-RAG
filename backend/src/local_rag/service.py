@@ -21,6 +21,8 @@ Rules:
 - Answer in the same language as the user's question.
 - End each factual sentence with the supporting source number such as [1] or [2].
 - Source numbers must match the numbered passages in the CONTEXT.
+- For comparisons, state only supported contrasts, use each subject's own definition, and do not
+  repeat the same distinction in different words.
 - Do not repeat passage labels, filenames, prompt instructions, or comments about your own answer.
 - Output only the answer itself, followed by inline source numbers.
 - Keep the answer concise, direct, and no longer than four paragraphs.
@@ -88,7 +90,12 @@ class RAGService:
             total_chunks += len(chunks)
         return IngestReport(processed, skipped, total_chunks)
 
-    def search(self, question: str, top_k: int = 3) -> list[SearchResult]:
+    def search(
+        self,
+        question: str,
+        top_k: int = 3,
+        sources: list[str] | None = None,
+    ) -> list[SearchResult]:
         clean = question.strip()
         if not clean:
             raise ValueError("Soru boş olamaz")
@@ -99,6 +106,7 @@ class RAGService:
             candidate_count,
             top_k,
             use_scope=not _has_named_anchor(clean),
+            allowed_sources=sources,
         )
         facets = _comparison_facets(clean)
         if len(facets) != 2 or top_k < 2:
@@ -107,7 +115,9 @@ class RAGService:
         balanced: list[SearchResult] = []
         seen: set[tuple[str, int]] = set()
         for facet in facets:
-            facet_results = self._retrieve(facet, candidate_count, 1)
+            facet_results = self._retrieve(
+                facet, candidate_count, 1, allowed_sources=sources
+            )
             if facet_results:
                 item = facet_results[0]
                 key = (item.source, item.position)
@@ -129,7 +139,27 @@ class RAGService:
         candidate_count: int,
         top_k: int,
         use_scope: bool = True,
+        allowed_sources: list[str] | None = None,
     ) -> list[SearchResult]:
+        if allowed_sources is not None:
+            if not allowed_sources:
+                return []
+            instructed_query = f"{RETRIEVAL_INSTRUCTION}{query}"
+            query_embedding = self.embeddings.embed([instructed_query])[0]
+            vector_results = self.store.search(
+                query_embedding, candidate_count, allowed_sources
+            )
+            keyword_results = self.store.keyword_search(
+                query, candidate_count, allowed_sources
+            )
+            fused = _hybrid_fuse(
+                vector_results,
+                keyword_results,
+                candidate_count,
+                per_source_limit=candidate_count,
+            )
+            return _rerank_section_matches(query, fused, top_k)
+
         scope_term, scoped_sources = _rarest_term_scope(
             self.store, query, candidate_count
         ) if use_scope else ("", [])
@@ -154,24 +184,51 @@ class RAGService:
             return _rerank_section_matches(query, fused, top_k)
         return fused[:top_k]
 
-    def answer(self, question: str, top_k: int = 3) -> Answer:
+    def answer(
+        self,
+        question: str,
+        top_k: int = 3,
+        sources: list[str] | None = None,
+    ) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
+        comparison_facets = _comparison_facets(question)
+        if sources:
+            glossary_answer = self._glossary_answer(
+                question, comparison_facets, sources
+            )
+            if glossary_answer is not None:
+                return glossary_answer
         retrieval_query = _normalize_retrieval_query(question)
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
-        expanded_top_k = (
-            max(top_k, 6)
-            if top_k > 1
-            and not _has_named_anchor(question)
-            and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
-            else top_k
-        )
+        expanded_top_k = top_k
         if _has_named_anchor(question):
-            results = self._retrieve(retrieval_query, 40, expanded_top_k, use_scope=False)
+            results = self._retrieve(
+                retrieval_query,
+                40,
+                expanded_top_k,
+                use_scope=False,
+                allowed_sources=sources,
+            )
         else:
-            results = self.search(question, expanded_top_k)
+            results = self.search(question, expanded_top_k, sources)
+
+        if comparison_facets:
+            focused_results = _filter_comparison_results(comparison_facets, results)
+            if focused_results:
+                results = focused_results[: max(top_k, len(comparison_facets))]
+
+        requested_profile_section = _requested_profile_section(question)
+        if requested_profile_section and sources:
+            result_sources = {result.source for result in results}
+            for source in sources:
+                if source in result_sources:
+                    continue
+                content = self.store.get_document_content(source)
+                if content:
+                    results.append(SearchResult(source, 0, content[:700], 1.0))
 
         structured = self._structured_document_answer(question, results)
         if structured is not None:
@@ -201,12 +258,17 @@ class RAGService:
             )
             for item in results
         ]
-        if not _has_relevant_evidence(
-            validation_query,
-            relevance_results,
-            allow_single_term=bool(scope_term),
-            allow_named_anchor=_has_named_anchor(question),
-        ):
+        has_evidence = (
+            _has_comparison_evidence(comparison_facets, relevance_results)
+            if comparison_facets
+            else _has_relevant_evidence(
+                validation_query,
+                relevance_results,
+                allow_single_term=bool(scope_term),
+                allow_named_anchor=_has_named_anchor(question),
+            )
+        )
+        if not has_evidence:
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
             f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 2), 1500 if scope_term else 1100)}"
@@ -271,6 +333,77 @@ class RAGService:
         clean_answer = _validate_citations(clean_answer, len(results))
         return Answer(clean_answer, results)
 
+    def _glossary_answer(
+        self, question: str, facets: list[str], sources: list[str]
+    ) -> Answer | None:
+        entries: list[tuple[str, str, str]] = []
+        for source in sources:
+            entries.extend(
+                (heading, definition, source)
+                for heading, definition in _extract_glossary_entries(
+                    self.store.get_document_content(source)
+                )
+            )
+        if not entries:
+            return None
+
+        selected: list[tuple[str, str, str]] = []
+        if facets:
+            for facet in facets:
+                match = next(
+                    (
+                        entry
+                        for entry in entries
+                        if facet.casefold().strip() in _glossary_aliases(entry[0])
+                    ),
+                    None,
+                )
+                if match is None:
+                    return None
+                selected.append(match)
+        else:
+            query_terms = _meaningful_terms(question)
+            ranked: list[tuple[float, tuple[str, str, str]]] = []
+            for entry in entries:
+                entry_terms = _meaningful_terms(f"{entry[0]} {entry[1]}")
+                matched = sum(
+                    1
+                    for term in query_terms
+                    if any(_terms_are_close(term, entry_term) for entry_term in entry_terms)
+                )
+                coverage = matched / max(len(query_terms), 1)
+                alias_bonus = 3.0 if question.casefold().strip(" ?.!") in _glossary_aliases(entry[0]) else 0.0
+                if matched >= 2 and coverage >= 0.45:
+                    ranked.append((matched + coverage + alias_bonus, entry))
+            if not ranked:
+                return None
+            selected = [max(ranked, key=lambda item: item[0])[1]]
+
+        used_sources = list(dict.fromkeys(source for _, _, source in selected))
+        evidence: list[SearchResult] = []
+        for source in used_sources:
+            terms = " ".join(
+                heading
+                for heading, _, definition_source in selected
+                if definition_source == source
+            )
+            matches = self.store.keyword_search(terms, 5, [source])
+            match = matches[0] if matches else SearchResult(
+                source, 0, self.store.get_document_content(source)[:700], 1.0
+            )
+            evidence.append(
+                SearchResult(match.source, match.position, match.content, 1.0)
+            )
+
+        source_numbers = {
+            result.source: index for index, result in enumerate(evidence, start=1)
+        }
+        lines = [
+            f"- {heading}: {definition} [{source_numbers[source]}]"
+            for heading, definition, source in selected
+        ]
+        return Answer("\n".join(lines) if len(lines) > 1 else lines[0][2:], evidence)
+
     def _structured_document_answer(
         self, question: str, results: list[SearchResult]
     ) -> Answer | None:
@@ -285,6 +418,41 @@ class RAGService:
             }.values()
         )
 
+        for result in unique_results:
+            if Path(result.source).suffix.lower() != ".xlsx":
+                continue
+            analysis_answer = _analyze_spreadsheet(
+                question, self.store.get_document_content(result.source)
+            )
+            if analysis_answer:
+                return Answer(f"{analysis_answer} [1]", [result])
+            summary_answer = _extract_spreadsheet_summary(
+                question, self.store.get_document_content(result.source)
+            )
+            if summary_answer:
+                return Answer(f"{summary_answer} [1]", [result])
+
+        if _is_person_identity_question(question):
+            for result in unique_results:
+                profile_answer = _person_profile_answer(
+                    question, self.store.get_document_content(result.source)
+                )
+                if profile_answer:
+                    return Answer(f"{profile_answer} [1]", [result])
+
+        requested_section = _requested_profile_section(question)
+        if requested_section:
+            heading, following_headings = requested_section
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    heading,
+                    following_headings,
+                )
+                formatted = _format_profile_section(heading, section)
+                if formatted:
+                    return Answer(f"{formatted} [1]", [result])
+
         if _is_project_list_question(question):
             for result in unique_results:
                 section = _extract_section(
@@ -294,9 +462,10 @@ class RAGService:
                 )
                 projects = _extract_projects(section)
                 if projects:
+                    selected_projects = _select_requested_projects(question, projects)
                     bullets = "\n".join(
                         f"- {name} — {description} [1]"
-                        for name, description in projects
+                        for name, description in selected_projects
                     )
                     return Answer(bullets, [result])
 
@@ -414,6 +583,45 @@ def _is_project_list_question(question: str) -> bool:
     return "project" in lowered or "proje" in lowered
 
 
+def _requested_profile_section(
+    question: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    terms = _meaningful_terms(question)
+    all_headings = (
+        "About Me",
+        "Education",
+        "Projects",
+        "Experience",
+        "Skills",
+        "Certificates",
+        "Sertificates",
+    )
+    if terms & {"experience", "experiences", "employment", "deneyim", "deneyimleri"}:
+        return "Experience", tuple(item for item in all_headings if item != "Experience")
+    if terms & {"skill", "skills", "yetenek", "yetenekler", "beceri", "beceriler"}:
+        return "Skills", tuple(item for item in all_headings if item != "Skills")
+    if terms & {"certificate", "certificates", "sertificate", "sertificates", "sertifika", "sertifikalar"}:
+        # Some CVs contain the misspelled heading "Sertificates".
+        return "Certificates", tuple(item for item in all_headings if item != "Certificates")
+    return None
+
+
+def _format_profile_section(heading: str, section: str) -> str:
+    if not section:
+        return ""
+    lines = []
+    for raw_line in section.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" \tâ€¢")
+        if not line or line.lower() == heading.lower():
+            continue
+        if re.fullmatch(r"\[Sayfa\s+\d+]", line, flags=re.IGNORECASE):
+            continue
+        lines.append(line)
+    if not lines:
+        return ""
+    return f"{heading}:\n" + "\n".join(f"- {line}" for line in lines)
+
+
 def _extract_section(
     content: str, heading: str, following_headings: tuple[str, ...]
 ) -> str:
@@ -468,6 +676,31 @@ def _extract_projects(section: str) -> list[tuple[str, str]]:
     return projects
 
 
+def _select_requested_projects(
+    question: str, projects: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    query_terms = _meaningful_terms(question) - {
+        "kardelen", "project", "projects", "proje", "projeler",
+    }
+    if not query_terms:
+        return projects
+
+    ranked: list[tuple[int, tuple[str, str]]] = []
+    for project in projects:
+        name_terms = _meaningful_terms(project[0])
+        score = sum(
+            1
+            for query_term in query_terms
+            if any(_terms_are_close(query_term, name_term) for name_term in name_terms)
+        )
+        ranked.append((score, project))
+
+    best_score = max(score for score, _ in ranked)
+    if best_score == 0:
+        return projects
+    return [project for score, project in ranked if score == best_score]
+
+
 def _format_education(section: str) -> str:
     if not section:
         return ""
@@ -481,6 +714,266 @@ def _format_education(section: str) -> str:
     institution = lines[0]
     program = lines[1]
     return f"{institution} — {program}."
+
+
+def _is_person_identity_question(question: str) -> bool:
+    lowered = question.lower().strip()
+    return bool(
+        re.search(r"\bwho\s+is\b", lowered)
+        or re.search(r"\bkimdir\b", lowered)
+        or re.search(r"\bkim\s+", lowered)
+    )
+
+
+def _person_profile_answer(question: str, content: str) -> str:
+    section = _extract_section(
+        content,
+        "About Me",
+        ("Education", "Projects", "Experience", "Skills"),
+    )
+    if not section:
+        return ""
+
+    before_section = content[: content.lower().find("about me")]
+    name_candidates = [
+        line.strip()
+        for line in before_section.splitlines()
+        if re.fullmatch(r"[A-ZÇĞİÖŞÜ][\wÇĞİÖŞÜçğıöşü'-]+(?:\s+[A-ZÇĞİÖŞÜ][\wÇĞİÖŞÜçğıöşü'-]+)+", line.strip())
+    ]
+    if not name_candidates:
+        return ""
+    name = name_candidates[-1]
+    question_terms = _meaningful_terms(question)
+    if not (_meaningful_terms(name) & question_terms):
+        return ""
+
+    profile = re.sub(r"(?<=[a-z])-\s*\n\s*(?=[a-z])", "", section)
+    profile = re.sub(r"\s+", " ", profile).strip()
+    profile = re.sub(r"^About Me\s*", "", profile, flags=re.IGNORECASE)
+    first_sentence = re.split(r"(?<=[.!?])\s+", profile, maxsplit=1)[0].strip()
+    if not first_sentence:
+        return ""
+    return f"{name} is a {first_sentence[0].lower() + first_sentence[1:]}"
+
+
+def _extract_spreadsheet_summary(question: str, content: str) -> str:
+    query_terms = _meaningful_terms(question) - {"many", "much"}
+    if not query_terms:
+        return ""
+
+    candidates: list[tuple[int, float, str, str]] = []
+    for line in content.splitlines():
+        cells = re.findall(
+            r"([A-Z]+)(\d+)=([^|]+?)(?=\s*\|\s*[A-Z]+\d+=|$)", line
+        )
+        for index, (column, row, raw_label) in enumerate(cells[:-1]):
+            next_column, next_row, raw_value = cells[index + 1]
+            if row != next_row or _column_number(next_column) != _column_number(column) + 1:
+                continue
+            label = raw_label.strip()
+            value = raw_value.strip()
+            if not _is_number(value):
+                continue
+            label_terms = _meaningful_terms(label)
+            matched = sum(
+                1
+                for query_term in query_terms
+                if any(_terms_are_close(query_term, label_term) for label_term in label_terms)
+            )
+            if matched:
+                candidates.append((matched, matched / len(query_terms), label, value))
+
+    if not candidates:
+        return ""
+    matched, coverage, label, value = max(
+        candidates, key=lambda item: (item[0], item[1], len(item[2]))
+    )
+    if matched < 2 and coverage < 1.0:
+        return ""
+    return f"{label}: {_format_summary_number(label, value)}."
+
+
+def _analyze_spreadsheet(question: str, content: str) -> str:
+    lowered = question.lower()
+    highest_requested = any(
+        term in lowered
+        for term in ("highest", "largest", "most", "maximum", "en yüksek", "en fazla")
+    )
+    total_requested = any(term in lowered for term in ("total", "sum", "toplam"))
+    if not highest_requested and not total_requested:
+        return ""
+
+    tables = _spreadsheet_tables(content)
+    query_terms = _meaningful_terms(question)
+    for headers, rows in tables:
+        metric = _best_matching_header(
+            query_terms,
+            headers,
+            rows,
+            numeric=True,
+        )
+        if not metric:
+            continue
+
+        if highest_requested:
+            dimension = _best_matching_header(
+                query_terms,
+                headers,
+                rows,
+                numeric=False,
+            )
+            if not dimension:
+                continue
+            grouped: dict[str, float] = {}
+            for row in rows:
+                label = row.get(dimension, "").strip()
+                value = row.get(metric, "").strip()
+                if label and _is_number(value):
+                    grouped[label] = grouped.get(label, 0.0) + float(value.replace(",", ""))
+            if grouped:
+                label, value = max(grouped.items(), key=lambda item: item[1])
+                return f"{label} had the highest {metric}: {_format_metric_value(metric, value)}."
+
+        if total_requested:
+            filters: list[tuple[str, str]] = []
+            metric_terms = _meaningful_terms(metric)
+            for header in headers:
+                if header == metric:
+                    continue
+                for value in {row.get(header, "").strip() for row in rows}:
+                    value_terms = _meaningful_terms(value)
+                    describes_metric = bool(value_terms) and all(
+                        any(_terms_are_close(term, metric_term) for metric_term in metric_terms)
+                        for term in value_terms - {"total", "toplam"}
+                    )
+                    if (
+                        value
+                        and not _is_number(value)
+                        and value.lower() in lowered
+                        and not describes_metric
+                    ):
+                        filters.append((header, value))
+            matching_rows = [
+                row
+                for row in rows
+                if all(row.get(header, "").strip() == value for header, value in filters)
+            ]
+            values = [
+                float(row[metric].replace(",", ""))
+                for row in matching_rows
+                if _is_number(row.get(metric, ""))
+            ]
+            if values:
+                if not filters:
+                    return f"Total {metric}: {_format_metric_value(metric, sum(values))}."
+                filter_text = ", ".join(value for _, value in filters)
+                return f"Total {metric} for {filter_text}: {_format_metric_value(metric, sum(values))}."
+    return ""
+
+
+def _spreadsheet_tables(content: str) -> list[tuple[list[str], list[dict[str, str]]]]:
+    sheet_rows: dict[str, dict[int, dict[str, str]]] = {}
+    current_sheet = "Workbook"
+    for line in content.splitlines():
+        sheet_match = re.match(r"\[Çalışma Sayfası:\s*(.+?)]", line.strip())
+        if sheet_match:
+            current_sheet = sheet_match.group(1)
+            sheet_rows.setdefault(current_sheet, {})
+            continue
+        for column, row_text, value in re.findall(
+            r"([A-Z]+)(\d+)=([^|]+?)(?=\s*\|\s*[A-Z]+\d+=|$)", line
+        ):
+            row_number = int(row_text)
+            sheet_rows.setdefault(current_sheet, {}).setdefault(row_number, {})[
+                column
+            ] = value.strip()
+
+    tables: list[tuple[list[str], list[dict[str, str]]]] = []
+    for rows_by_number in sheet_rows.values():
+        ordered = sorted(rows_by_number.items())
+        for header_index, (header_row_number, header_cells) in enumerate(ordered):
+            if len(header_cells) < 2 or not all(
+                value and not _is_number(value) for value in header_cells.values()
+            ):
+                continue
+            columns = sorted(header_cells, key=_column_number)
+            headers = [header_cells[column] for column in columns]
+            data_rows: list[dict[str, str]] = []
+            for row_number, cells in ordered[header_index + 1 :]:
+                if row_number <= header_row_number:
+                    continue
+                mapped = {
+                    header_cells[column]: cells.get(column, "")
+                    for column in columns
+                }
+                if sum(bool(value) for value in mapped.values()) >= 2:
+                    data_rows.append(mapped)
+            if data_rows:
+                tables.append((headers, data_rows))
+                break
+    return tables
+
+
+def _best_matching_header(
+    query_terms: set[str],
+    headers: list[str],
+    rows: list[dict[str, str]],
+    *,
+    numeric: bool,
+) -> str:
+    ranked: list[tuple[int, int, str]] = []
+    for header in headers:
+        values = [row.get(header, "") for row in rows if row.get(header, "")]
+        if not values:
+            continue
+        numeric_ratio = sum(_is_number(value) for value in values) / len(values)
+        if numeric != (numeric_ratio >= 0.7):
+            continue
+        header_terms = _meaningful_terms(header)
+        score = sum(
+            1
+            for query_term in query_terms
+            if any(_terms_are_close(query_term, header_term) for header_term in header_terms)
+        )
+        if score:
+            extra_terms = len(
+                {
+                    term
+                    for term in header_terms
+                    if not any(_terms_are_close(term, query_term) for query_term in query_terms)
+                }
+            )
+            ranked.append((score, -extra_terms, header))
+    return max(ranked, default=(0, 0, ""), key=lambda item: (item[0], item[1]))[2]
+
+
+def _format_metric_value(metric: str, value: float) -> str:
+    formatted = f"{int(value):,}" if value.is_integer() else f"{value:,.2f}"
+    return f"{formatted} TRY" if "try" in metric.lower() else formatted
+
+
+def _column_number(column: str) -> int:
+    number = 0
+    for character in column:
+        number = number * 26 + ord(character) - ord("A") + 1
+    return number
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value.replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+
+def _format_summary_number(label: str, value: str) -> str:
+    number = float(value.replace(",", ""))
+    if "margin" in label.lower() and abs(number) <= 1:
+        return f"{number:.1%}"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
 def _has_named_anchor(question: str) -> bool:
@@ -803,6 +1296,94 @@ def _comparison_facets(question: str) -> list[str]:
     if turkish:
         return [turkish.group(1).strip(), turkish.group(2).strip()]
     return []
+
+
+def _extract_glossary_entries(content: str) -> list[tuple[str, str]]:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in content.splitlines()]
+    entries: list[tuple[str, str]] = []
+    for index, line in enumerate(lines):
+        if (
+            not line
+            or len(line) > 100
+            or re.search(r"[.!?]$", line)
+            or re.fullmatch(r"(?:\[Sayfa\s+\d+]|Page\s+\d+\s+of\s+\d+|\d+)", line, flags=re.IGNORECASE)
+        ):
+            continue
+        definition_parts: list[str] = []
+        for candidate in lines[index + 1 : index + 12]:
+            if not candidate:
+                continue
+            if re.fullmatch(r"\[Sayfa\s+\d+]", candidate, flags=re.IGNORECASE):
+                break
+            definition_parts.append(candidate)
+            if re.search(r"[.!?]$", candidate):
+                break
+        definition = " ".join(definition_parts).strip()
+        if not definition or not re.search(r"[.!?]$", definition):
+            continue
+        normalized_definition = re.sub(r"^(?:a|an|the)\s+", "", definition.casefold())
+        if any(
+            normalized_definition.startswith(f"{alias} ")
+            for alias in _glossary_aliases(line)
+        ):
+            entries.append((line, definition))
+    return entries
+
+
+def _glossary_aliases(heading: str) -> set[str]:
+    normalized = re.sub(r"\s+", " ", heading.casefold()).strip()
+    aliases = {normalized}
+    parenthetical = re.search(r"\(([^)]+)\)\s*$", normalized)
+    if parenthetical:
+        aliases.add(parenthetical.group(1).strip())
+        aliases.add(normalized[: parenthetical.start()].strip())
+    return {alias for alias in aliases if alias}
+
+
+def _extract_glossary_definition(content: str, term: str) -> str:
+    normalized_term = term.casefold().strip()
+    for heading, definition in _extract_glossary_entries(content):
+        if normalized_term in _glossary_aliases(heading):
+            return definition
+    return ""
+
+
+def _filter_comparison_results(
+    facets: list[str], results: list[SearchResult]
+) -> list[SearchResult]:
+    facet_terms = [_meaningful_terms(facet) for facet in facets]
+    focused: list[SearchResult] = []
+    covered_facets: set[int] = set()
+    for result in results:
+        content_terms = _meaningful_terms(result.content)
+        matched_facets = {
+            index
+            for index, terms in enumerate(facet_terms)
+            if terms and all(
+                any(_terms_are_close(term, content_term) for content_term in content_terms)
+                for term in terms
+            )
+        }
+        if matched_facets:
+            focused.append(result)
+            covered_facets.update(matched_facets)
+    return focused if len(covered_facets) == len(facet_terms) else []
+
+
+def _has_comparison_evidence(
+    facets: list[str], results: list[SearchResult]
+) -> bool:
+    if not facets or not results:
+        return False
+    evidence_terms = _meaningful_terms(" ".join(item.content for item in results))
+    return all(
+        terms
+        and all(
+            any(_terms_are_close(term, evidence_term) for evidence_term in evidence_terms)
+            for term in terms
+        )
+        for terms in (_meaningful_terms(facet) for facet in facets)
+    )
 
 
 def _validate_citations(text: str, source_count: int) -> str:

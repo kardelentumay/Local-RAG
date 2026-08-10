@@ -6,7 +6,7 @@ type DocumentItem = {
   source: string;
   name: string;
   meta: string;
-  kind: "pdf" | "md" | "txt";
+  kind: "pdf" | "md" | "txt" | "xlsx";
   category: string;
   active: boolean;
 };
@@ -24,6 +24,7 @@ type ChatItem = {
   id: number;
   title: string;
   date: string;
+  exchanges: Exchange[];
 };
 
 type SourceItem = {
@@ -49,18 +50,7 @@ type AskResponse = {
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_LOCAL_RAG_API_URL ?? "http://127.0.0.1:8000";
-
-const initialChats: ChatItem[] = [
-  { id: 1, title: "Agentic vs. traditional RAG", date: "Today" },
-  { id: 2, title: "RAGAS evaluation metrics", date: "Yesterday" },
-  { id: 3, title: "Corrective RAG summary", date: "Jul 21" },
-];
-
-const suggestions = [
-  "How does Corrective RAG work?",
-  "How does RAGAS measure faithfulness?",
-  "Compare agentic and traditional RAG.",
-];
+const CHAT_STORAGE_KEY = "nivora-chat-history-v1";
 
 function renderAnswerText(
   text: string,
@@ -97,15 +87,21 @@ function toDocumentItem(document: DocumentResponse): DocumentItem {
     source: document.source,
     name: document.name,
     meta: `${document.chunks} ${document.chunks === 1 ? "chunk" : "chunks"}`,
-    kind: kind === "pdf" || kind === "txt" ? kind : "md",
+    kind: kind === "pdf" || kind === "txt" || kind === "xlsx" ? kind : "md",
     category,
     active: true,
   };
 }
 
+function chatTitle(question: string): string {
+  const clean = question.trim().replace(/\s+/g, " ");
+  return clean.length > 42 ? `${clean.slice(0, 39)}…` : clean;
+}
+
 export default function Home() {
-  const [chats, setChats] = useState(initialChats);
-  const [activeChatId, setActiveChatId] = useState<number | null>(1);
+  const [chats, setChats] = useState<ChatItem[]>([]);
+  const [activeChatId, setActiveChatId] = useState<number | null>(null);
+  const [chatHistoryLoaded, setChatHistoryLoaded] = useState(false);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [activeSources, setActiveSources] = useState<SourceItem[]>([]);
@@ -141,6 +137,37 @@ export default function Home() {
   const existingCategories = categories.map(([category]) => category);
 
   useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(CHAT_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored) as ChatItem[];
+      if (!Array.isArray(parsed)) return;
+      const restored = parsed.map((chat) => ({
+        ...chat,
+        exchanges: Array.isArray(chat.exchanges) ? chat.exchanges : [],
+      }));
+      setChats(restored);
+      const firstChat = restored[0];
+      if (firstChat) {
+        setActiveChatId(firstChat.id);
+        setExchanges(firstChat.exchanges);
+        const lastExchange = firstChat.exchanges.at(-1);
+        setActiveSources(lastExchange?.sources ?? []);
+        setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+      }
+    } catch {
+      window.localStorage.removeItem(CHAT_STORAGE_KEY);
+    } finally {
+      setChatHistoryLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!chatHistoryLoaded) return;
+    window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chats.slice(0, 30)));
+  }, [chats, chatHistoryLoaded]);
+
+  useEffect(() => {
     let cancelled = false;
     async function loadDocuments() {
       try {
@@ -173,7 +200,15 @@ export default function Home() {
   async function submitQuestion(event: FormEvent) {
     event.preventDefault();
     const question = query.trim();
+    const chatIdAtSubmit = activeChatId;
     if (!question || isAsking) return;
+    const selectedSources = documents
+      .filter((document) => document.active)
+      .map((document) => document.source);
+    if (selectedSources.length === 0) {
+      setNotice("Select at least one document to search.");
+      return;
+    }
     setIsAsking(true);
     setNotice("");
     setQuery("");
@@ -182,7 +217,7 @@ export default function Home() {
       const response = await fetch(`${API_BASE_URL}/api/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 2 }),
+        body: JSON.stringify({ question, top_k: 2, sources: selectedSources }),
       });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { detail?: string } | null;
@@ -197,6 +232,24 @@ export default function Home() {
         elapsedSeconds: (performance.now() - startedAt) / 1000,
       };
       setExchanges((current) => [...current, exchange]);
+      if (chatIdAtSubmit === null) {
+        const newChat: ChatItem = {
+          id: exchange.id,
+          title: chatTitle(question),
+          date: "Today",
+          exchanges: [exchange],
+        };
+        setChats((current) => [newChat, ...current].slice(0, 30));
+        setActiveChatId(newChat.id);
+      } else {
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatIdAtSubmit
+              ? { ...chat, exchanges: [...chat.exchanges, exchange] }
+              : chat
+          )
+        );
+      }
       if (result.sources.length > 0) {
         setActiveSources(result.sources);
         setSelectedSourceNumber(result.sources[0].number);
@@ -274,17 +327,35 @@ export default function Home() {
     const chat = chats.find((item) => item.id === id);
     const remainingChats = chats.filter((item) => item.id !== id);
     setChats(remainingChats);
-    if (activeChatId === id) setActiveChatId(remainingChats[0]?.id ?? null);
+    if (activeChatId === id) {
+      const nextChat = remainingChats[0];
+      setActiveChatId(nextChat?.id ?? null);
+      setExchanges(nextChat?.exchanges ?? []);
+      const lastExchange = nextChat?.exchanges.at(-1);
+      setActiveSources(lastExchange?.sources ?? []);
+      setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+    }
     if (chat) setNotice(`“${chat.title}” was removed from chat history.`);
   }
 
   function startNewChat() {
+    setActiveChatId(null);
     setExchanges([]);
     setActiveSources([]);
     setSelectedSourceNumber(null);
     setSourcesOpen(false);
     setQuery("");
     setNotice("A new chat was started.");
+  }
+
+  function openChat(chat: ChatItem) {
+    setActiveChatId(chat.id);
+    setExchanges(chat.exchanges);
+    const lastExchange = chat.exchanges.at(-1);
+    setActiveSources(lastExchange?.sources ?? []);
+    setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+    setSourcesOpen(false);
+    setNotice("");
   }
 
   return (
@@ -328,7 +399,7 @@ export default function Home() {
                   <button
                     type="button"
                     className="history-main"
-                    onClick={() => setActiveChatId(chat.id)}
+                    onClick={() => openChat(chat)}
                     aria-label={`Open ${chat.title}`}
                   >
                     <span className="history-icon">◌</span>
@@ -345,6 +416,9 @@ export default function Home() {
                   </button>
                 </div>
               ))}
+              {chatHistoryLoaded && chats.length === 0 && (
+                <p className="empty-history">Your saved chats will appear here.</p>
+              )}
             </nav>
           </section>
 
@@ -357,7 +431,7 @@ export default function Home() {
                 ref={fileInputRef}
                 className="file-input"
                 type="file"
-                accept=".pdf,.md,.txt"
+                accept=".pdf,.md,.txt,.xlsx"
                 onChange={uploadDocument}
               />
               <button
@@ -376,6 +450,12 @@ export default function Home() {
             <div className="document-groups">
               {categories.map(([category, categoryDocuments]) => {
                 const isOpen = openCategories[category] ?? true;
+                const allCategoryDocumentsSelected = categoryDocuments.every(
+                  (document) => document.active
+                );
+                const someCategoryDocumentsSelected = categoryDocuments.some(
+                  (document) => document.active
+                );
                 return (
                   <section className="document-category" key={category}>
                     <div className="collection-row">
@@ -383,20 +463,44 @@ export default function Home() {
                         <b>{category}</b>
                         <small>{categoryDocuments.length} {categoryDocuments.length === 1 ? "document" : "documents"}</small>
                       </span>
-                      <button
-                        className={`category-toggle ${isOpen ? "is-open" : ""}`}
-                        type="button"
-                        aria-label={isOpen ? `Collapse ${category}` : `Expand ${category}`}
-                        aria-expanded={isOpen}
-                        onClick={() =>
-                          setOpenCategories((current) => ({
-                            ...current,
-                            [category]: !isOpen,
-                          }))
-                        }
-                      >
-                        <img src="/category-dropdown.svg" alt="" />
-                      </button>
+                      <span className="category-actions">
+                        <label className="category-select-all">
+                          <input
+                            type="checkbox"
+                            checked={allCategoryDocumentsSelected}
+                            ref={(element) => {
+                              if (element) {
+                                element.indeterminate =
+                                  someCategoryDocumentsSelected && !allCategoryDocumentsSelected;
+                              }
+                            }}
+                            onChange={() =>
+                              setDocuments((current) =>
+                                current.map((document) =>
+                                  document.category === category
+                                    ? { ...document, active: !allCategoryDocumentsSelected }
+                                    : document
+                                )
+                              )
+                            }
+                          />
+                          <small>Select all</small>
+                        </label>
+                        <button
+                          className={`category-toggle ${isOpen ? "is-open" : ""}`}
+                          type="button"
+                          aria-label={isOpen ? `Collapse ${category}` : `Expand ${category}`}
+                          aria-expanded={isOpen}
+                          onClick={() =>
+                            setOpenCategories((current) => ({
+                              ...current,
+                              [category]: !isOpen,
+                            }))
+                          }
+                        >
+                          <img src="/category-dropdown.svg" alt="" />
+                        </button>
+                      </span>
                     </div>
 
                     {isOpen && <div className="document-list">
@@ -469,12 +573,6 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="suggestions">
-              {suggestions.map((suggestion) => (
-                <button key={suggestion} onClick={() => setQuery(suggestion)}>{suggestion}</button>
-              ))}
-            </div>
-
             {exchanges.map((exchange) => (
               <div className="exchange" key={exchange.id}>
                 <div className="user-message">{exchange.question}</div>
@@ -522,7 +620,7 @@ export default function Home() {
               <div className="composer-controls">
                 <span>Search the <b>local RAG index</b></span>
                 <button type="submit" className="send-button" aria-label="Send question" disabled={isAsking || !query.trim()}>
-                  {isAsking ? "Thinking…" : "Send ↗"}
+                  {isAsking ? "Thinking…" : "Send"}
                 </button>
               </div>
             </div>
@@ -545,6 +643,7 @@ export default function Home() {
             <span className="source-count">{activeSources.length}</span>
           </div>
 
+          <div className="source-content">
           {activeSources.length > 0 ? (
             <>
               <div className="source-tabs" style={{ gridTemplateColumns: `repeat(${activeSources.length}, 1fr)` }}>
@@ -566,8 +665,8 @@ export default function Home() {
                   </div>
                   <div className="confidence">
                     <span>Relevance</span>
-                    <b>{Math.round(selectedSource.score * 100)}%</b>
-                    <i><em style={{ width: `${Math.round(selectedSource.score * 100)}%` }} /></i>
+                    <b>{Math.round(Math.max(0, Math.min(1, selectedSource.score)) * 100)}%</b>
+                    <i><em style={{ width: `${Math.round(Math.max(0, Math.min(1, selectedSource.score)) * 100)}%` }} /></i>
                   </div>
                   <blockquote>{selectedSource.content}</blockquote>
                 </article>
@@ -579,6 +678,7 @@ export default function Home() {
               <p>Ask a question and open a citation to inspect its supporting document passage.</p>
             </div>
           )}
+          </div>
 
         </aside>}
       </div>

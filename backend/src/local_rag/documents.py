@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .models import Chunk
 
-SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf"}
+SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf", ".xlsx"}
 
 
 def discover_documents(path: Path) -> list[Path]:
@@ -33,7 +33,55 @@ def read_document(path: Path) -> str:
             if text:
                 pages.append(f"[Sayfa {number}]\n{text}")
         return "\n\n".join(pages)
+    if suffix == ".xlsx":
+        return _read_excel_workbook(path)
     raise ValueError(f"Desteklenmeyen belge türü: {path.suffix}")
+
+
+def _read_excel_workbook(path: Path) -> str:
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError("Excel okumak için openpyxl kurulmalıdır.") from exc
+
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Excel dosyası okunamadı: {path.name}") from exc
+
+    sections: list[str] = []
+    try:
+        for worksheet in workbook.worksheets:
+            rows: list[str] = []
+            for row_number, cells in enumerate(worksheet.iter_rows(), start=1):
+                values: list[str] = []
+                for column_number, cell in enumerate(cells, start=1):
+                    value = cell.value
+                    if value is None or str(value).strip() == "":
+                        continue
+                    coordinate = f"{get_column_letter(column_number)}{row_number}"
+                    values.append(f"{coordinate}={_format_excel_value(value)}")
+                if values:
+                    rows.append(" | ".join(values))
+            if rows:
+                sections.append(
+                    f"[Çalışma Sayfası: {worksheet.title}]\n" + "\n".join(rows)
+                )
+    finally:
+        workbook.close()
+    return "\n\n".join(sections)
+
+
+def _format_excel_value(value: object) -> str:
+    if hasattr(value, "isoformat"):
+        try:
+            return str(value.isoformat())
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 def chunk_text(text: str, source: str, chunk_size: int = 1200, overlap: int = 200) -> list[Chunk]:

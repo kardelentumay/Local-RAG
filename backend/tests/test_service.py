@@ -7,11 +7,20 @@ from local_rag.service import (
     FALLBACK_ANSWER_EN,
     FALLBACK_ANSWER_TR,
     RAGService,
+    _analyze_spreadsheet,
     _context_excerpt,
+    _extract_section,
+    _extract_glossary_definition,
+    _extract_spreadsheet_summary,
+    _filter_comparison_results,
     _build_answer_prompt,
     _has_relevant_evidence,
+    _has_comparison_evidence,
     _hybrid_fuse,
     _normalize_retrieval_query,
+    _person_profile_answer,
+    _requested_profile_section,
+    _format_profile_section,
     _rarest_term_sources,
     _rerank_section_matches,
     _validate_citations,
@@ -119,6 +128,20 @@ class ServiceTests(unittest.TestCase):
         results = self.store.keyword_search(
             "projects",
             5,
+            sources=["other.md"],
+        )
+        self.assertTrue(results)
+        self.assertEqual({"other.md"}, {item.source for item in results})
+
+    def test_search_is_limited_to_selected_documents(self):
+        (self.docs / "other.md").write_text(
+            "This document describes unrelated software projects.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        results = self.service.search(
+            "bilgisayar",
+            3,
             sources=["other.md"],
         )
         self.assertTrue(results)
@@ -419,6 +442,220 @@ class ServiceTests(unittest.TestCase):
     def test_citation_validator_removes_standalone_citation_inside_answer(self):
         answer = _validate_citations("First paragraph.\n\n[2]\nSecond paragraph. [1] [2]", 2)
         self.assertEqual("First paragraph.\nSecond paragraph. [1] [2]", answer)
+
+    def test_spreadsheet_summary_matches_units_sold(self):
+        content = (
+            "[Çalışma Sayfası: Analysis]\n"
+            "A4=Total Revenue | B4=3795460\n"
+            "A6=Total Units Sold | B6=748"
+        )
+        answer = _extract_spreadsheet_summary(
+            "How many units were sold?", content
+        )
+        self.assertEqual("Total Units Sold: 748.", answer)
+
+    def test_spreadsheet_summary_formats_margin_as_percentage(self):
+        content = "A7=Overall Profit Margin | B7=0.2791888203"
+        answer = _extract_spreadsheet_summary(
+            "What is the overall profit margin?", content
+        )
+        self.assertEqual("Overall Profit Margin: 27.9%.", answer)
+
+    def test_spreadsheet_analysis_groups_and_filters_rows(self):
+        content = """[Çalışma Sayfası: Sales Data]
+A1=Region | B1=Product | C1=Revenue (TRY) | D1=Profit (TRY)
+A2=Marmara | B2=Laptop | C2=100 | D2=30
+A3=Ege | B3=Keyboard | C3=80 | D3=20
+A4=Marmara | B4=Laptop | C4=150 | D4=40
+A5=Ege | B5=Keyboard | C5=120 | D5=35"""
+        self.assertEqual(
+            "Total Revenue (TRY) for Marmara: 250 TRY.",
+            _analyze_spreadsheet(
+                "What is the total revenue for the Marmara region?", content
+            ),
+        )
+        self.assertEqual(
+            "Laptop had the highest Profit (TRY): 70 TRY.",
+            _analyze_spreadsheet(
+                "Which product generated the highest profit?", content
+            ),
+        )
+
+    def test_spreadsheet_analysis_totals_all_rows_without_a_filter(self):
+        content = """[Ã‡alÄ±ÅŸma SayfasÄ±: Sales Data]
+A1=Region | B1=Revenue (TRY) | C1=Profit (TRY) | D1=Units Sold
+A2=Marmara | B2=100 | C2=30 | D2=4
+A3=Ege | B3=80 | C3=20 | D3=6
+A4=Marmara | B4=150 | C4=40 | D4=5"""
+        self.assertEqual(
+            "Total Revenue (TRY): 330 TRY.",
+            _analyze_spreadsheet("What is the total revenue?", content),
+        )
+        self.assertEqual(
+            "Total Profit (TRY): 90 TRY.",
+            _analyze_spreadsheet("What is the total profit?", content),
+        )
+        self.assertEqual(
+            "Total Units Sold: 15.",
+            _analyze_spreadsheet("How many total units were sold?", content),
+        )
+
+    def test_spreadsheet_metric_label_is_not_treated_as_a_filter(self):
+        content = """[Ã‡alÄ±ÅŸma SayfasÄ±: Analysis]
+A3=Metric | B3=Value | D3=Month | E3=Revenue (TRY) | F3=Profit (TRY)
+A4=Total Revenue | B4=3795460 | D4=January | E4=460750 | F4=125350
+A5=Total Profit | B5=1059650 | D5=February | E5=429160 | F5=123860"""
+        self.assertEqual(
+            "Total Revenue (TRY): 889,910 TRY.",
+            _analyze_spreadsheet("What is the total revenue?", content),
+        )
+
+    def test_spreadsheet_analysis_finds_highest_month(self):
+        content = """[Çalışma Sayfası: Analysis]
+D3=Month | E3=Revenue (TRY) | F3=Profit (TRY)
+D4=January | E4=460750 | F4=125350
+D5=June | E5=811000 | F5=237700"""
+        self.assertEqual(
+            "June had the highest Revenue (TRY): 811,000 TRY.",
+            _analyze_spreadsheet("Which month had the highest revenue?", content),
+        )
+
+    def test_person_identity_uses_about_me_section(self):
+        content = """[Sayfa 1]
+Kardelen Tumay
+About Me
+Recent Software Engineering graduate with practical experience in full-stack development and software design.
+Education
+Eastern Mediterranean University"""
+        self.assertEqual(
+            "Kardelen Tumay is a recent Software Engineering graduate with practical experience in full-stack development and software design.",
+            _person_profile_answer("Who is Kardelen?", content),
+        )
+
+    def test_profile_section_questions_work_with_or_without_a_person_name(self):
+        self.assertEqual(
+            "Experience",
+            _requested_profile_section("What are Kardelen's experiences?")[0],
+        )
+        self.assertEqual(
+            "Experience",
+            _requested_profile_section("What is the work experience?")[0],
+        )
+        self.assertEqual(
+            "Skills",
+            _requested_profile_section("What are the skills?")[0],
+        )
+
+    def test_profile_section_formatter_keeps_only_requested_section(self):
+        content = """Experience
+Software Development Intern
+Built internal web applications.
+Skills
+Python, React, SQL"""
+        section = _extract_section(content, "Experience", ("Skills",))
+        self.assertEqual(
+            "Experience:\n- Software Development Intern\n- Built internal web applications.",
+            _format_profile_section("Experience", section),
+        )
+
+    def test_comparison_filter_removes_unrelated_document_sources(self):
+        results = [
+            SearchResult(
+                "cloud.pdf",
+                1,
+                "A private cloud is dedicated to one organization.",
+                0.8,
+            ),
+            SearchResult(
+                "cloud.pdf",
+                2,
+                "A public cloud provides shared infrastructure to multiple customers.",
+                0.7,
+            ),
+            SearchResult(
+                "cv.pdf",
+                4,
+                "Software engineering skills include React and SQLite.",
+                0.6,
+            ),
+        ]
+        filtered = _filter_comparison_results(
+            ["private cloud", "public cloud"], results
+        )
+        self.assertEqual(["cloud.pdf", "cloud.pdf"], [item.source for item in filtered])
+
+    def test_comparison_filter_keeps_balanced_results_when_one_facet_is_missing(self):
+        results = [
+            SearchResult(
+                "cloud.pdf",
+                1,
+                "A private cloud is dedicated to one organization.",
+                0.8,
+            ),
+            SearchResult("other.pdf", 1, "Unrelated terminology.", 0.5),
+        ]
+        self.assertEqual(
+            [],
+            _filter_comparison_results(["private cloud", "public cloud"], results),
+        )
+
+    def test_comparison_evidence_checks_both_facets_not_the_word_differences(self):
+        results = [
+            SearchResult("cloud.pdf", 1, "Private cloud serves one organization.", 0.4),
+            SearchResult("cloud.pdf", 2, "Public cloud uses shared infrastructure.", 0.4),
+        ]
+        self.assertTrue(
+            _has_comparison_evidence(["private cloud", "public cloud"], results)
+        )
+
+    def test_glossary_definition_joins_wrapped_pdf_lines(self):
+        content = """Private cloud
+A private cloud is a deployment model where resources are dedicated to a single
+user or organization.
+
+Public cloud
+A public cloud makes services available to multiple organizations."""
+        self.assertEqual(
+            "A private cloud is a deployment model where resources are dedicated to a single user or organization.",
+            _extract_glossary_definition(content, "private cloud"),
+        )
+        self.assertEqual(
+            "A public cloud makes services available to multiple organizations.",
+            _extract_glossary_definition(content, "public cloud"),
+        )
+
+    def test_glossary_answers_acronym_comparisons_and_definition_queries(self):
+        glossary = self.docs / "cloud-glossary.md"
+        glossary.write_text(
+            """Platform as a service (PaaS)
+Platform as a service (PaaS) provides a platform to develop and manage applications.
+
+Software as a service (SaaS)
+Software as a service (SaaS) delivers software applications over the internet.
+
+Multicloud
+Multicloud is the use of more than one public cloud.
+""",
+            encoding="utf-8",
+        )
+        self.service.ingest(glossary, chunk_size=500, overlap=50)
+
+        comparison = self.service.answer(
+            "What are the differences between SaaS and PaaS?",
+            2,
+            ["cloud-glossary.md"],
+        )
+        self.assertIn("Software as a service (SaaS)", comparison.text)
+        self.assertIn("Platform as a service (PaaS)", comparison.text)
+        self.assertEqual(1, len(comparison.sources))
+
+        definition = self.service.answer(
+            "What is the thing that uses more than one public cloud?",
+            2,
+            ["cloud-glossary.md"],
+        )
+        self.assertIn("Multicloud", definition.text)
+        self.assertEqual(1, len(definition.sources))
 
 
 if __name__ == "__main__":
