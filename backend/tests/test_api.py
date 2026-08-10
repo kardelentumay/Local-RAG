@@ -62,6 +62,8 @@ class APITests(unittest.TestCase):
         self.assertEqual("ok", response.status)
         self.assertEqual("local", response.mode)
         self.assertFalse(response.models_loaded)
+        self.assertEqual("nivora-local-rag", response.application)
+        self.assertGreater(response.pid, 0)
 
     def test_status_returns_database_counts(self):
         response = asyncio.run(api.status())

@@ -192,11 +192,17 @@ class RAGService:
     ) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
+        comparison_facets = _comparison_facets(question)
+        if comparison_facets and sources:
+            glossary_answer = self._glossary_comparison_answer(
+                comparison_facets, sources
+            )
+            if glossary_answer is not None:
+                return glossary_answer
         retrieval_query = _normalize_retrieval_query(question)
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
-        comparison_facets = _comparison_facets(question)
         expanded_top_k = (
             max(top_k, 6)
             if top_k > 1
@@ -259,12 +265,17 @@ class RAGService:
             )
             for item in results
         ]
-        if not _has_relevant_evidence(
-            validation_query,
-            relevance_results,
-            allow_single_term=bool(scope_term),
-            allow_named_anchor=_has_named_anchor(question),
-        ):
+        has_evidence = (
+            _has_comparison_evidence(comparison_facets, relevance_results)
+            if comparison_facets
+            else _has_relevant_evidence(
+                validation_query,
+                relevance_results,
+                allow_single_term=bool(scope_term),
+                allow_named_anchor=_has_named_anchor(question),
+            )
+        )
+        if not has_evidence:
             return Answer(_fallback_for(question), [])
         context = "\n\n".join(
             f"[{index}]\n{_context_excerpt(retrieval_query, self.store.get_window(item.source, item.position, 1, 2), 1500 if scope_term else 1100)}"
@@ -328,6 +339,52 @@ class RAGService:
             return Answer(_fallback_for(question), [])
         clean_answer = _validate_citations(clean_answer, len(results))
         return Answer(clean_answer, results)
+
+    def _glossary_comparison_answer(
+        self, facets: list[str], sources: list[str]
+    ) -> Answer | None:
+        definitions: list[tuple[str, str, str]] = []
+        for facet in facets:
+            match: tuple[str, str] | None = None
+            for source in sources:
+                definition = _extract_glossary_definition(
+                    self.store.get_document_content(source), facet
+                )
+                if definition:
+                    match = (source, definition)
+                    break
+            if match is None:
+                return None
+            definitions.append((facet, match[0], match[1]))
+
+        used_sources = list(dict.fromkeys(source for _, source, _ in definitions))
+        evidence: list[SearchResult] = []
+        for source in used_sources:
+            terms = " ".join(
+                facet
+                for facet, definition_source, _ in definitions
+                if definition_source == source
+            )
+            matches = self.store.keyword_search(terms, 5, [source])
+            evidence.append(
+                matches[0]
+                if matches
+                else SearchResult(
+                    source,
+                    0,
+                    self.store.get_document_content(source)[:700],
+                    1.0,
+                )
+            )
+
+        source_numbers = {
+            result.source: index for index, result in enumerate(evidence, start=1)
+        }
+        lines = [
+            f"- {facet.title()}: {definition} [{source_numbers[source]}]"
+            for facet, source, definition in definitions
+        ]
+        return Answer("\n".join(lines), evidence)
 
     def _structured_document_answer(
         self, question: str, results: list[SearchResult]
@@ -1223,23 +1280,63 @@ def _comparison_facets(question: str) -> list[str]:
     return []
 
 
+def _extract_glossary_definition(content: str, term: str) -> str:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in content.splitlines()]
+    normalized_term = term.casefold().strip()
+    for index, line in enumerate(lines):
+        if line.casefold() != normalized_term:
+            continue
+        definition_parts: list[str] = []
+        for candidate in lines[index + 1 : index + 12]:
+            if not candidate:
+                continue
+            if re.fullmatch(r"\[Sayfa\s+\d+]", candidate, flags=re.IGNORECASE):
+                break
+            definition_parts.append(candidate)
+            if re.search(r"[.!?]$", candidate):
+                break
+        definition = " ".join(definition_parts).strip()
+        if definition and re.search(r"[.!?]$", definition):
+            return definition
+    return ""
+
+
 def _filter_comparison_results(
     facets: list[str], results: list[SearchResult]
 ) -> list[SearchResult]:
     facet_terms = [_meaningful_terms(facet) for facet in facets]
     focused: list[SearchResult] = []
+    covered_facets: set[int] = set()
     for result in results:
         content_terms = _meaningful_terms(result.content)
-        if any(
-            terms
-            and all(
+        matched_facets = {
+            index
+            for index, terms in enumerate(facet_terms)
+            if terms and all(
                 any(_terms_are_close(term, content_term) for content_term in content_terms)
                 for term in terms
             )
-            for terms in facet_terms
-        ):
+        }
+        if matched_facets:
             focused.append(result)
-    return focused
+            covered_facets.update(matched_facets)
+    return focused if len(covered_facets) == len(facet_terms) else []
+
+
+def _has_comparison_evidence(
+    facets: list[str], results: list[SearchResult]
+) -> bool:
+    if not facets or not results:
+        return False
+    evidence_terms = _meaningful_terms(" ".join(item.content for item in results))
+    return all(
+        terms
+        and all(
+            any(_terms_are_close(term, evidence_term) for evidence_term in evidence_terms)
+            for term in terms
+        )
+        for terms in (_meaningful_terms(facet) for facet in facets)
+    )
 
 
 def _validate_citations(text: str, source_count: int) -> str:

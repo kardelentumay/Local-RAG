@@ -10,10 +10,12 @@ from local_rag.service import (
     _analyze_spreadsheet,
     _context_excerpt,
     _extract_section,
+    _extract_glossary_definition,
     _extract_spreadsheet_summary,
     _filter_comparison_results,
     _build_answer_prompt,
     _has_relevant_evidence,
+    _has_comparison_evidence,
     _hybrid_fuse,
     _normalize_retrieval_query,
     _person_profile_answer,
@@ -581,6 +583,46 @@ Python, React, SQL"""
             ["private cloud", "public cloud"], results
         )
         self.assertEqual(["cloud.pdf", "cloud.pdf"], [item.source for item in filtered])
+
+    def test_comparison_filter_keeps_balanced_results_when_one_facet_is_missing(self):
+        results = [
+            SearchResult(
+                "cloud.pdf",
+                1,
+                "A private cloud is dedicated to one organization.",
+                0.8,
+            ),
+            SearchResult("other.pdf", 1, "Unrelated terminology.", 0.5),
+        ]
+        self.assertEqual(
+            [],
+            _filter_comparison_results(["private cloud", "public cloud"], results),
+        )
+
+    def test_comparison_evidence_checks_both_facets_not_the_word_differences(self):
+        results = [
+            SearchResult("cloud.pdf", 1, "Private cloud serves one organization.", 0.4),
+            SearchResult("cloud.pdf", 2, "Public cloud uses shared infrastructure.", 0.4),
+        ]
+        self.assertTrue(
+            _has_comparison_evidence(["private cloud", "public cloud"], results)
+        )
+
+    def test_glossary_definition_joins_wrapped_pdf_lines(self):
+        content = """Private cloud
+A private cloud is a deployment model where resources are dedicated to a single
+user or organization.
+
+Public cloud
+A public cloud makes services available to multiple organizations."""
+        self.assertEqual(
+            "A private cloud is a deployment model where resources are dedicated to a single user or organization.",
+            _extract_glossary_definition(content, "private cloud"),
+        )
+        self.assertEqual(
+            "A public cloud makes services available to multiple organizations.",
+            _extract_glossary_definition(content, "public cloud"),
+        )
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
 const { app, BrowserWindow, dialog, net, protocol } = require("electron");
 const { spawn } = require("node:child_process");
+const { execFileSync } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
 const API_BASE_URL = "http://127.0.0.1:8000";
+const INSTANCE_TOKEN = randomUUID();
 let backendProcess = null;
 
 protocol.registerSchemesAsPrivileged([
@@ -20,15 +23,21 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-async function backendIsReady() {
+async function backendHealth() {
   try {
     const response = await fetch(`${API_BASE_URL}/api/health`, {
       signal: AbortSignal.timeout(1200),
     });
-    return response.ok;
+    return response.ok ? await response.json() : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function backendIsReady() {
+  const health = await backendHealth();
+  return health?.application === "nivora-local-rag"
+    && health.instance_token === INSTANCE_TOKEN;
 }
 
 function backendExecutable() {
@@ -39,7 +48,21 @@ function backendExecutable() {
 }
 
 async function startBackend() {
-  if (await backendIsReady()) return;
+  const existing = await backendHealth();
+  if (existing?.application === "nivora-local-rag" && existing.instance_token === INSTANCE_TOKEN) {
+    return;
+  }
+  if (existing?.application === "nivora-local-rag" && existing.instance_token && existing.pid) {
+    execFileSync("taskkill.exe", ["/PID", String(existing.pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    for (let attempt = 0; attempt < 20 && await backendHealth(); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  } else if (existing) {
+    throw new Error("Port 8000 is being used by another or outdated backend. Close it and reopen Nivora.");
+  }
 
   const executable = backendExecutable();
   if (!fs.existsSync(executable)) {
@@ -60,6 +83,7 @@ async function startBackend() {
       ...process.env,
       LOCAL_RAG_DB: path.join(dataRoot, "knowledge.db"),
       LOCAL_RAG_DOCUMENTS: documentsRoot,
+      LOCAL_RAG_INSTANCE_TOKEN: INSTANCE_TOKEN,
     },
     windowsHide: true,
     stdio: "ignore",
@@ -109,7 +133,21 @@ function createWindow() {
   });
 }
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+}
+
+app.on("second-instance", () => {
+  const window = BrowserWindow.getAllWindows()[0];
+  if (window) {
+    if (window.isMinimized()) window.restore();
+    window.focus();
+  }
+});
+
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
   registerDesktopProtocol();
   try {
     await startBackend();

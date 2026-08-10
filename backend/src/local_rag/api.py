@@ -38,6 +38,9 @@ class HealthResponse(BaseModel):
     status: str
     mode: str
     models_loaded: bool
+    application: str
+    instance_token: str
+    pid: int
 
 
 class StatusResponse(BaseModel):
@@ -179,7 +182,14 @@ app.add_middleware(
 
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", mode="local", models_loaded=runtime.models_loaded)
+    return HealthResponse(
+        status="ok",
+        mode="local",
+        models_loaded=runtime.models_loaded,
+        application="nivora-local-rag",
+        instance_token=os.environ.get("LOCAL_RAG_INSTANCE_TOKEN", ""),
+        pid=os.getpid(),
+    )
 
 
 @app.get("/api/status", response_model=StatusResponse)
