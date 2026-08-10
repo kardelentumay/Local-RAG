@@ -2,16 +2,38 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
-data/*.db
-data/*.db-*
+*.egg-info/
+
+# Local databases, uploaded documents and model caches
+data/
+backend/data/
+backend/documents/uploads/
 models/
 dist/
-*.egg-info/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated reports, archives and scratch output
+tmp/
+outputs/
+*.docx
+*.zip
+~$*
+
+# Local tooling and temporary integration copies
+.agents/
+*-staging/
 
 # Unified project folders
 backend/.venv/
-backend/data/*.db
-backend/data/*.db-*
+backend/.venv-backup/
 backend/models/
 backend/build/
 backend/dist/
