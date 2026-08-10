@@ -24,6 +24,7 @@ type ChatItem = {
   id: number;
   title: string;
   date: string;
+  exchanges: Exchange[];
 };
 
 type SourceItem = {
@@ -49,12 +50,7 @@ type AskResponse = {
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_LOCAL_RAG_API_URL ?? "http://127.0.0.1:8000";
-
-const initialChats: ChatItem[] = [
-  { id: 1, title: "Agentic vs. traditional RAG", date: "Today" },
-  { id: 2, title: "RAGAS evaluation metrics", date: "Yesterday" },
-  { id: 3, title: "Corrective RAG summary", date: "Jul 21" },
-];
+const CHAT_STORAGE_KEY = "nivora-chat-history-v1";
 
 const suggestions = [
   "How does Corrective RAG work?",
@@ -103,9 +99,15 @@ function toDocumentItem(document: DocumentResponse): DocumentItem {
   };
 }
 
+function chatTitle(question: string): string {
+  const clean = question.trim().replace(/\s+/g, " ");
+  return clean.length > 42 ? `${clean.slice(0, 39)}…` : clean;
+}
+
 export default function Home() {
-  const [chats, setChats] = useState(initialChats);
-  const [activeChatId, setActiveChatId] = useState<number | null>(1);
+  const [chats, setChats] = useState<ChatItem[]>([]);
+  const [activeChatId, setActiveChatId] = useState<number | null>(null);
+  const [chatHistoryLoaded, setChatHistoryLoaded] = useState(false);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [activeSources, setActiveSources] = useState<SourceItem[]>([]);
@@ -141,6 +143,37 @@ export default function Home() {
   const existingCategories = categories.map(([category]) => category);
 
   useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(CHAT_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored) as ChatItem[];
+      if (!Array.isArray(parsed)) return;
+      const restored = parsed.map((chat) => ({
+        ...chat,
+        exchanges: Array.isArray(chat.exchanges) ? chat.exchanges : [],
+      }));
+      setChats(restored);
+      const firstChat = restored[0];
+      if (firstChat) {
+        setActiveChatId(firstChat.id);
+        setExchanges(firstChat.exchanges);
+        const lastExchange = firstChat.exchanges.at(-1);
+        setActiveSources(lastExchange?.sources ?? []);
+        setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+      }
+    } catch {
+      window.localStorage.removeItem(CHAT_STORAGE_KEY);
+    } finally {
+      setChatHistoryLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!chatHistoryLoaded) return;
+    window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chats.slice(0, 30)));
+  }, [chats, chatHistoryLoaded]);
+
+  useEffect(() => {
     let cancelled = false;
     async function loadDocuments() {
       try {
@@ -173,6 +206,7 @@ export default function Home() {
   async function submitQuestion(event: FormEvent) {
     event.preventDefault();
     const question = query.trim();
+    const chatIdAtSubmit = activeChatId;
     if (!question || isAsking) return;
     const selectedSources = documents
       .filter((document) => document.active)
@@ -204,6 +238,24 @@ export default function Home() {
         elapsedSeconds: (performance.now() - startedAt) / 1000,
       };
       setExchanges((current) => [...current, exchange]);
+      if (chatIdAtSubmit === null) {
+        const newChat: ChatItem = {
+          id: exchange.id,
+          title: chatTitle(question),
+          date: "Today",
+          exchanges: [exchange],
+        };
+        setChats((current) => [newChat, ...current].slice(0, 30));
+        setActiveChatId(newChat.id);
+      } else {
+        setChats((current) =>
+          current.map((chat) =>
+            chat.id === chatIdAtSubmit
+              ? { ...chat, exchanges: [...chat.exchanges, exchange] }
+              : chat
+          )
+        );
+      }
       if (result.sources.length > 0) {
         setActiveSources(result.sources);
         setSelectedSourceNumber(result.sources[0].number);
@@ -281,17 +333,35 @@ export default function Home() {
     const chat = chats.find((item) => item.id === id);
     const remainingChats = chats.filter((item) => item.id !== id);
     setChats(remainingChats);
-    if (activeChatId === id) setActiveChatId(remainingChats[0]?.id ?? null);
+    if (activeChatId === id) {
+      const nextChat = remainingChats[0];
+      setActiveChatId(nextChat?.id ?? null);
+      setExchanges(nextChat?.exchanges ?? []);
+      const lastExchange = nextChat?.exchanges.at(-1);
+      setActiveSources(lastExchange?.sources ?? []);
+      setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+    }
     if (chat) setNotice(`“${chat.title}” was removed from chat history.`);
   }
 
   function startNewChat() {
+    setActiveChatId(null);
     setExchanges([]);
     setActiveSources([]);
     setSelectedSourceNumber(null);
     setSourcesOpen(false);
     setQuery("");
     setNotice("A new chat was started.");
+  }
+
+  function openChat(chat: ChatItem) {
+    setActiveChatId(chat.id);
+    setExchanges(chat.exchanges);
+    const lastExchange = chat.exchanges.at(-1);
+    setActiveSources(lastExchange?.sources ?? []);
+    setSelectedSourceNumber(lastExchange?.sources[0]?.number ?? null);
+    setSourcesOpen(false);
+    setNotice("");
   }
 
   return (
@@ -335,7 +405,7 @@ export default function Home() {
                   <button
                     type="button"
                     className="history-main"
-                    onClick={() => setActiveChatId(chat.id)}
+                    onClick={() => openChat(chat)}
                     aria-label={`Open ${chat.title}`}
                   >
                     <span className="history-icon">◌</span>
@@ -352,6 +422,9 @@ export default function Home() {
                   </button>
                 </div>
               ))}
+              {chatHistoryLoaded && chats.length === 0 && (
+                <p className="empty-history">Your saved chats will appear here.</p>
+              )}
             </nav>
           </section>
 

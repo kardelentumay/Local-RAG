@@ -137,6 +137,7 @@ body {
 }
 .history-row:hover, .history-row.is-current { background: var(--white); box-shadow: 0 5px 18px rgba(44,47,85,.07); }
 .history-row.is-current { box-shadow: inset 3px 0 var(--purple), 0 5px 18px rgba(44,47,85,.07); }
+.empty-history { margin: 8px 6px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .history-main {
   min-width: 0; display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 8px; align-items: center;
   border: 0; padding: 4px 2px; text-align: left; background: transparent; color: inherit;
