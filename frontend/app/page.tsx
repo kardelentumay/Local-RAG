@@ -677,8 +677,8 @@ export default function Home() {
                   </div>
                   <div className="confidence">
                     <span>Relevance</span>
-                    <b>{Math.round(selectedSource.score * 100)}%</b>
-                    <i><em style={{ width: `${Math.round(selectedSource.score * 100)}%` }} /></i>
+                    <b>{Math.round(Math.max(0, Math.min(1, selectedSource.score)) * 100)}%</b>
+                    <i><em style={{ width: `${Math.round(Math.max(0, Math.min(1, selectedSource.score)) * 100)}%` }} /></i>
                   </div>
                   <blockquote>{selectedSource.content}</blockquote>
                 </article>

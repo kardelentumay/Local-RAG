@@ -193,9 +193,9 @@ class RAGService:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
         comparison_facets = _comparison_facets(question)
-        if comparison_facets and sources:
-            glossary_answer = self._glossary_comparison_answer(
-                comparison_facets, sources
+        if sources:
+            glossary_answer = self._glossary_answer(
+                question, comparison_facets, sources
             )
             if glossary_answer is not None:
                 return glossary_answer
@@ -203,14 +203,7 @@ class RAGService:
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
-        expanded_top_k = (
-            max(top_k, 6)
-            if top_k > 1
-            and not comparison_facets
-            and not _has_named_anchor(question)
-            and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
-            else top_k
-        )
+        expanded_top_k = top_k
         if _has_named_anchor(question):
             results = self._retrieve(
                 retrieval_query,
@@ -340,51 +333,76 @@ class RAGService:
         clean_answer = _validate_citations(clean_answer, len(results))
         return Answer(clean_answer, results)
 
-    def _glossary_comparison_answer(
-        self, facets: list[str], sources: list[str]
+    def _glossary_answer(
+        self, question: str, facets: list[str], sources: list[str]
     ) -> Answer | None:
-        definitions: list[tuple[str, str, str]] = []
-        for facet in facets:
-            match: tuple[str, str] | None = None
-            for source in sources:
-                definition = _extract_glossary_definition(
-                    self.store.get_document_content(source), facet
+        entries: list[tuple[str, str, str]] = []
+        for source in sources:
+            entries.extend(
+                (heading, definition, source)
+                for heading, definition in _extract_glossary_entries(
+                    self.store.get_document_content(source)
                 )
-                if definition:
-                    match = (source, definition)
-                    break
-            if match is None:
-                return None
-            definitions.append((facet, match[0], match[1]))
+            )
+        if not entries:
+            return None
 
-        used_sources = list(dict.fromkeys(source for _, source, _ in definitions))
+        selected: list[tuple[str, str, str]] = []
+        if facets:
+            for facet in facets:
+                match = next(
+                    (
+                        entry
+                        for entry in entries
+                        if facet.casefold().strip() in _glossary_aliases(entry[0])
+                    ),
+                    None,
+                )
+                if match is None:
+                    return None
+                selected.append(match)
+        else:
+            query_terms = _meaningful_terms(question)
+            ranked: list[tuple[float, tuple[str, str, str]]] = []
+            for entry in entries:
+                entry_terms = _meaningful_terms(f"{entry[0]} {entry[1]}")
+                matched = sum(
+                    1
+                    for term in query_terms
+                    if any(_terms_are_close(term, entry_term) for entry_term in entry_terms)
+                )
+                coverage = matched / max(len(query_terms), 1)
+                alias_bonus = 3.0 if question.casefold().strip(" ?.!") in _glossary_aliases(entry[0]) else 0.0
+                if matched >= 2 and coverage >= 0.45:
+                    ranked.append((matched + coverage + alias_bonus, entry))
+            if not ranked:
+                return None
+            selected = [max(ranked, key=lambda item: item[0])[1]]
+
+        used_sources = list(dict.fromkeys(source for _, _, source in selected))
         evidence: list[SearchResult] = []
         for source in used_sources:
             terms = " ".join(
-                facet
-                for facet, definition_source, _ in definitions
+                heading
+                for heading, _, definition_source in selected
                 if definition_source == source
             )
             matches = self.store.keyword_search(terms, 5, [source])
+            match = matches[0] if matches else SearchResult(
+                source, 0, self.store.get_document_content(source)[:700], 1.0
+            )
             evidence.append(
-                matches[0]
-                if matches
-                else SearchResult(
-                    source,
-                    0,
-                    self.store.get_document_content(source)[:700],
-                    1.0,
-                )
+                SearchResult(match.source, match.position, match.content, 1.0)
             )
 
         source_numbers = {
             result.source: index for index, result in enumerate(evidence, start=1)
         }
         lines = [
-            f"- {facet.title()}: {definition} [{source_numbers[source]}]"
-            for facet, source, definition in definitions
+            f"- {heading}: {definition} [{source_numbers[source]}]"
+            for heading, definition, source in selected
         ]
-        return Answer("\n".join(lines), evidence)
+        return Answer("\n".join(lines) if len(lines) > 1 else lines[0][2:], evidence)
 
     def _structured_document_answer(
         self, question: str, results: list[SearchResult]
@@ -1280,11 +1298,16 @@ def _comparison_facets(question: str) -> list[str]:
     return []
 
 
-def _extract_glossary_definition(content: str, term: str) -> str:
+def _extract_glossary_entries(content: str) -> list[tuple[str, str]]:
     lines = [re.sub(r"\s+", " ", line).strip() for line in content.splitlines()]
-    normalized_term = term.casefold().strip()
+    entries: list[tuple[str, str]] = []
     for index, line in enumerate(lines):
-        if line.casefold() != normalized_term:
+        if (
+            not line
+            or len(line) > 100
+            or re.search(r"[.!?]$", line)
+            or re.fullmatch(r"(?:\[Sayfa\s+\d+]|Page\s+\d+\s+of\s+\d+|\d+)", line, flags=re.IGNORECASE)
+        ):
             continue
         definition_parts: list[str] = []
         for candidate in lines[index + 1 : index + 12]:
@@ -1296,7 +1319,31 @@ def _extract_glossary_definition(content: str, term: str) -> str:
             if re.search(r"[.!?]$", candidate):
                 break
         definition = " ".join(definition_parts).strip()
-        if definition and re.search(r"[.!?]$", definition):
+        if not definition or not re.search(r"[.!?]$", definition):
+            continue
+        normalized_definition = re.sub(r"^(?:a|an|the)\s+", "", definition.casefold())
+        if any(
+            normalized_definition.startswith(f"{alias} ")
+            for alias in _glossary_aliases(line)
+        ):
+            entries.append((line, definition))
+    return entries
+
+
+def _glossary_aliases(heading: str) -> set[str]:
+    normalized = re.sub(r"\s+", " ", heading.casefold()).strip()
+    aliases = {normalized}
+    parenthetical = re.search(r"\(([^)]+)\)\s*$", normalized)
+    if parenthetical:
+        aliases.add(parenthetical.group(1).strip())
+        aliases.add(normalized[: parenthetical.start()].strip())
+    return {alias for alias in aliases if alias}
+
+
+def _extract_glossary_definition(content: str, term: str) -> str:
+    normalized_term = term.casefold().strip()
+    for heading, definition in _extract_glossary_entries(content):
+        if normalized_term in _glossary_aliases(heading):
             return definition
     return ""
 

@@ -326,7 +326,7 @@ async def ask(request: AskRequest) -> AskResponse:
             number=index,
             document=item.source,
             chunk=item.position + 1,
-            score=round(item.score, 4),
+            score=round(max(0.0, min(1.0, item.score)), 4),
             content=item.content,
         )
         for index, item in enumerate(answer.sources, start=1)

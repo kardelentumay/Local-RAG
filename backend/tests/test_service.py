@@ -624,6 +624,39 @@ A public cloud makes services available to multiple organizations."""
             _extract_glossary_definition(content, "public cloud"),
         )
 
+    def test_glossary_answers_acronym_comparisons_and_definition_queries(self):
+        glossary = self.docs / "cloud-glossary.md"
+        glossary.write_text(
+            """Platform as a service (PaaS)
+Platform as a service (PaaS) provides a platform to develop and manage applications.
+
+Software as a service (SaaS)
+Software as a service (SaaS) delivers software applications over the internet.
+
+Multicloud
+Multicloud is the use of more than one public cloud.
+""",
+            encoding="utf-8",
+        )
+        self.service.ingest(glossary, chunk_size=500, overlap=50)
+
+        comparison = self.service.answer(
+            "What are the differences between SaaS and PaaS?",
+            2,
+            ["cloud-glossary.md"],
+        )
+        self.assertIn("Software as a service (SaaS)", comparison.text)
+        self.assertIn("Platform as a service (PaaS)", comparison.text)
+        self.assertEqual(1, len(comparison.sources))
+
+        definition = self.service.answer(
+            "What is the thing that uses more than one public cloud?",
+            2,
+            ["cloud-glossary.md"],
+        )
+        self.assertIn("Multicloud", definition.text)
+        self.assertEqual(1, len(definition.sources))
+
 
 if __name__ == "__main__":
     unittest.main()
