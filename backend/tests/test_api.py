@@ -17,8 +17,9 @@ class FakeRuntime:
     def stats(self):
         return 20, 1692
 
-    def ask(self, question: str, top_k: int):
+    def ask(self, question: str, top_k: int, sources=None):
         self.models_loaded = True
+        self.last_sources = sources
         return Answer(
             text=f"Grounded answer for {question} [1]",
             sources=[
@@ -69,13 +70,22 @@ class APITests(unittest.TestCase):
         self.assertEqual(str(self.fake_runtime.db_path), response.database)
 
     def test_ask_returns_numbered_sources(self):
-        response = asyncio.run(api.ask(api.AskRequest(question="What is RAG?", top_k=2)))
+        response = asyncio.run(
+            api.ask(
+                api.AskRequest(
+                    question="What is RAG?",
+                    top_k=2,
+                    sources=["paper.md"],
+                )
+            )
+        )
         self.assertIn("[1]", response.answer)
         self.assertEqual(1, len(response.sources))
         self.assertEqual(1, response.sources[0].number)
         self.assertEqual("paper.md", response.sources[0].document)
         self.assertEqual(5, response.sources[0].chunk)
         self.assertEqual(0.9123, response.sources[0].score)
+        self.assertEqual(["paper.md"], self.fake_runtime.last_sources)
 
     def test_documents_returns_indexed_files(self):
         response = asyncio.run(api.documents())

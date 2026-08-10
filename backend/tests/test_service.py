@@ -124,6 +124,20 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(results)
         self.assertEqual({"other.md"}, {item.source for item in results})
 
+    def test_search_is_limited_to_selected_documents(self):
+        (self.docs / "other.md").write_text(
+            "This document describes unrelated software projects.",
+            encoding="utf-8",
+        )
+        self.service.ingest(self.docs, chunk_size=100, overlap=10)
+        results = self.service.search(
+            "bilgisayar",
+            3,
+            sources=["other.md"],
+        )
+        self.assertTrue(results)
+        self.assertEqual({"other.md"}, {item.source for item in results})
+
     def test_rarest_term_identifies_document_scope(self):
         (self.docs / "cv.md").write_text(
             "Kardelen Tumay\nProjects\nLocal RAG application.",

@@ -49,6 +49,7 @@ class StatusResponse(BaseModel):
 class AskRequest(BaseModel):
     question: Annotated[str, Field(min_length=1, max_length=4000)]
     top_k: Annotated[int, Field(ge=1, le=5)] = 2
+    sources: list[str] | None = None
 
 
 class SourceResponse(BaseModel):
@@ -104,10 +105,12 @@ class LocalRAGRuntime:
     def stats(self) -> tuple[int, int]:
         return SQLiteStore(self.db_path).stats()
 
-    def ask(self, question: str, top_k: int) -> Answer:
+    def ask(
+        self, question: str, top_k: int, sources: list[str] | None = None
+    ) -> Answer:
         with self._lock:
             service = self._get_service()
-            return service.answer(question, top_k)
+            return service.answer(question, top_k, sources)
 
     def list_documents(self) -> list[dict[str, object]]:
         return SQLiteStore(self.db_path).list_documents()
@@ -298,7 +301,9 @@ async def ask(request: AskRequest) -> AskResponse:
     if not question:
         raise HTTPException(status_code=422, detail="Question cannot be blank.")
     try:
-        answer = await asyncio.to_thread(runtime.ask, question, request.top_k)
+        answer = await asyncio.to_thread(
+            runtime.ask, question, request.top_k, request.sources
+        )
     except (RuntimeError, ValueError) as exc:
         LOGGER.exception("Local model inference failed.")
         raise HTTPException(

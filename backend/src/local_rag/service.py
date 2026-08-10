@@ -88,7 +88,12 @@ class RAGService:
             total_chunks += len(chunks)
         return IngestReport(processed, skipped, total_chunks)
 
-    def search(self, question: str, top_k: int = 3) -> list[SearchResult]:
+    def search(
+        self,
+        question: str,
+        top_k: int = 3,
+        sources: list[str] | None = None,
+    ) -> list[SearchResult]:
         clean = question.strip()
         if not clean:
             raise ValueError("Soru boş olamaz")
@@ -99,6 +104,7 @@ class RAGService:
             candidate_count,
             top_k,
             use_scope=not _has_named_anchor(clean),
+            allowed_sources=sources,
         )
         facets = _comparison_facets(clean)
         if len(facets) != 2 or top_k < 2:
@@ -107,7 +113,9 @@ class RAGService:
         balanced: list[SearchResult] = []
         seen: set[tuple[str, int]] = set()
         for facet in facets:
-            facet_results = self._retrieve(facet, candidate_count, 1)
+            facet_results = self._retrieve(
+                facet, candidate_count, 1, allowed_sources=sources
+            )
             if facet_results:
                 item = facet_results[0]
                 key = (item.source, item.position)
@@ -129,7 +137,27 @@ class RAGService:
         candidate_count: int,
         top_k: int,
         use_scope: bool = True,
+        allowed_sources: list[str] | None = None,
     ) -> list[SearchResult]:
+        if allowed_sources is not None:
+            if not allowed_sources:
+                return []
+            instructed_query = f"{RETRIEVAL_INSTRUCTION}{query}"
+            query_embedding = self.embeddings.embed([instructed_query])[0]
+            vector_results = self.store.search(
+                query_embedding, candidate_count, allowed_sources
+            )
+            keyword_results = self.store.keyword_search(
+                query, candidate_count, allowed_sources
+            )
+            fused = _hybrid_fuse(
+                vector_results,
+                keyword_results,
+                candidate_count,
+                per_source_limit=candidate_count,
+            )
+            return _rerank_section_matches(query, fused, top_k)
+
         scope_term, scoped_sources = _rarest_term_scope(
             self.store, query, candidate_count
         ) if use_scope else ("", [])
@@ -154,7 +182,12 @@ class RAGService:
             return _rerank_section_matches(query, fused, top_k)
         return fused[:top_k]
 
-    def answer(self, question: str, top_k: int = 3) -> Answer:
+    def answer(
+        self,
+        question: str,
+        top_k: int = 3,
+        sources: list[str] | None = None,
+    ) -> Answer:
         if self.chat is None:
             raise RuntimeError("Cevap üretmek için chat sağlayıcısı gerekli")
         retrieval_query = _normalize_retrieval_query(question)
@@ -169,9 +202,15 @@ class RAGService:
             else top_k
         )
         if _has_named_anchor(question):
-            results = self._retrieve(retrieval_query, 40, expanded_top_k, use_scope=False)
+            results = self._retrieve(
+                retrieval_query,
+                40,
+                expanded_top_k,
+                use_scope=False,
+                allowed_sources=sources,
+            )
         else:
-            results = self.search(question, expanded_top_k)
+            results = self.search(question, expanded_top_k, sources)
 
         structured = self._structured_document_answer(question, results)
         if structured is not None:
@@ -294,9 +333,10 @@ class RAGService:
                 )
                 projects = _extract_projects(section)
                 if projects:
+                    selected_projects = _select_requested_projects(question, projects)
                     bullets = "\n".join(
                         f"- {name} — {description} [1]"
-                        for name, description in projects
+                        for name, description in selected_projects
                     )
                     return Answer(bullets, [result])
 
@@ -466,6 +506,31 @@ def _extract_projects(section: str) -> list[tuple[str, str]]:
         if sentence:
             projects.append((name, sentence))
     return projects
+
+
+def _select_requested_projects(
+    question: str, projects: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    query_terms = _meaningful_terms(question) - {
+        "kardelen", "project", "projects", "proje", "projeler",
+    }
+    if not query_terms:
+        return projects
+
+    ranked: list[tuple[int, tuple[str, str]]] = []
+    for project in projects:
+        name_terms = _meaningful_terms(project[0])
+        score = sum(
+            1
+            for query_term in query_terms
+            if any(_terms_are_close(query_term, name_term) for name_term in name_terms)
+        )
+        ranked.append((score, project))
+
+    best_score = max(score for score, _ in ranked)
+    if best_score == 0:
+        return projects
+    return [project for score, project in ranked if score == best_score]
 
 
 def _format_education(section: str) -> str:

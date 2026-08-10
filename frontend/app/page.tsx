@@ -174,6 +174,13 @@ export default function Home() {
     event.preventDefault();
     const question = query.trim();
     if (!question || isAsking) return;
+    const selectedSources = documents
+      .filter((document) => document.active)
+      .map((document) => document.source);
+    if (selectedSources.length === 0) {
+      setNotice("Select at least one document to search.");
+      return;
+    }
     setIsAsking(true);
     setNotice("");
     setQuery("");
@@ -182,7 +189,7 @@ export default function Home() {
       const response = await fetch(`${API_BASE_URL}/api/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 2 }),
+        body: JSON.stringify({ question, top_k: 2, sources: selectedSources }),
       });
       if (!response.ok) {
         const error = await response.json().catch(() => null) as { detail?: string } | null;
@@ -376,6 +383,12 @@ export default function Home() {
             <div className="document-groups">
               {categories.map(([category, categoryDocuments]) => {
                 const isOpen = openCategories[category] ?? true;
+                const allCategoryDocumentsSelected = categoryDocuments.every(
+                  (document) => document.active
+                );
+                const someCategoryDocumentsSelected = categoryDocuments.some(
+                  (document) => document.active
+                );
                 return (
                   <section className="document-category" key={category}>
                     <div className="collection-row">
@@ -383,20 +396,44 @@ export default function Home() {
                         <b>{category}</b>
                         <small>{categoryDocuments.length} {categoryDocuments.length === 1 ? "document" : "documents"}</small>
                       </span>
-                      <button
-                        className={`category-toggle ${isOpen ? "is-open" : ""}`}
-                        type="button"
-                        aria-label={isOpen ? `Collapse ${category}` : `Expand ${category}`}
-                        aria-expanded={isOpen}
-                        onClick={() =>
-                          setOpenCategories((current) => ({
-                            ...current,
-                            [category]: !isOpen,
-                          }))
-                        }
-                      >
-                        <img src="/category-dropdown.svg" alt="" />
-                      </button>
+                      <span className="category-actions">
+                        <label className="category-select-all">
+                          <input
+                            type="checkbox"
+                            checked={allCategoryDocumentsSelected}
+                            ref={(element) => {
+                              if (element) {
+                                element.indeterminate =
+                                  someCategoryDocumentsSelected && !allCategoryDocumentsSelected;
+                              }
+                            }}
+                            onChange={() =>
+                              setDocuments((current) =>
+                                current.map((document) =>
+                                  document.category === category
+                                    ? { ...document, active: !allCategoryDocumentsSelected }
+                                    : document
+                                )
+                              )
+                            }
+                          />
+                          <small>Select all</small>
+                        </label>
+                        <button
+                          className={`category-toggle ${isOpen ? "is-open" : ""}`}
+                          type="button"
+                          aria-label={isOpen ? `Collapse ${category}` : `Expand ${category}`}
+                          aria-expanded={isOpen}
+                          onClick={() =>
+                            setOpenCategories((current) => ({
+                              ...current,
+                              [category]: !isOpen,
+                            }))
+                          }
+                        >
+                          <img src="/category-dropdown.svg" alt="" />
+                        </button>
+                      </span>
                     </div>
 
                     {isOpen && <div className="document-list">
