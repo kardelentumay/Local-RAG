@@ -14,6 +14,7 @@ from local_rag.service import (
     _has_relevant_evidence,
     _hybrid_fuse,
     _normalize_retrieval_query,
+    _person_profile_answer,
     _rarest_term_sources,
     _rerank_section_matches,
     _validate_citations,
@@ -482,6 +483,18 @@ D5=June | E5=811000 | F5=237700"""
         self.assertEqual(
             "June had the highest Revenue (TRY): 811,000 TRY.",
             _analyze_spreadsheet("Which month had the highest revenue?", content),
+        )
+
+    def test_person_identity_uses_about_me_section(self):
+        content = """[Sayfa 1]
+Kardelen Tumay
+About Me
+Recent Software Engineering graduate with practical experience in full-stack development and software design.
+Education
+Eastern Mediterranean University"""
+        self.assertEqual(
+            "Kardelen Tumay is a recent Software Engineering graduate with practical experience in full-stack development and software design.",
+            _person_profile_answer("Who is Kardelen?", content),
         )
 
 

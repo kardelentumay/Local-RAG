@@ -338,6 +338,14 @@ class RAGService:
             if summary_answer:
                 return Answer(f"{summary_answer} [1]", [result])
 
+        if _is_person_identity_question(question):
+            for result in unique_results:
+                profile_answer = _person_profile_answer(
+                    question, self.store.get_document_content(result.source)
+                )
+                if profile_answer:
+                    return Answer(f"{profile_answer} [1]", [result])
+
         if _is_project_list_question(question):
             for result in unique_results:
                 section = _extract_section(
@@ -560,6 +568,46 @@ def _format_education(section: str) -> str:
     institution = lines[0]
     program = lines[1]
     return f"{institution} — {program}."
+
+
+def _is_person_identity_question(question: str) -> bool:
+    lowered = question.lower().strip()
+    return bool(
+        re.search(r"\bwho\s+is\b", lowered)
+        or re.search(r"\bkimdir\b", lowered)
+        or re.search(r"\bkim\s+", lowered)
+    )
+
+
+def _person_profile_answer(question: str, content: str) -> str:
+    section = _extract_section(
+        content,
+        "About Me",
+        ("Education", "Projects", "Experience", "Skills"),
+    )
+    if not section:
+        return ""
+
+    before_section = content[: content.lower().find("about me")]
+    name_candidates = [
+        line.strip()
+        for line in before_section.splitlines()
+        if re.fullmatch(r"[A-ZÇĞİÖŞÜ][\wÇĞİÖŞÜçğıöşü'-]+(?:\s+[A-ZÇĞİÖŞÜ][\wÇĞİÖŞÜçğıöşü'-]+)+", line.strip())
+    ]
+    if not name_candidates:
+        return ""
+    name = name_candidates[-1]
+    question_terms = _meaningful_terms(question)
+    if not (_meaningful_terms(name) & question_terms):
+        return ""
+
+    profile = re.sub(r"(?<=[a-z])-\s*\n\s*(?=[a-z])", "", section)
+    profile = re.sub(r"\s+", " ", profile).strip()
+    profile = re.sub(r"^About Me\s*", "", profile, flags=re.IGNORECASE)
+    first_sentence = re.split(r"(?<=[.!?])\s+", profile, maxsplit=1)[0].strip()
+    if not first_sentence:
+        return ""
+    return f"{name} is a {first_sentence[0].lower() + first_sentence[1:]}"
 
 
 def _extract_spreadsheet_summary(question: str, content: str) -> str:
