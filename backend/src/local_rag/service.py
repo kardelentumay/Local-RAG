@@ -21,6 +21,8 @@ Rules:
 - Answer in the same language as the user's question.
 - End each factual sentence with the supporting source number such as [1] or [2].
 - Source numbers must match the numbered passages in the CONTEXT.
+- For comparisons, state only supported contrasts, use each subject's own definition, and do not
+  repeat the same distinction in different words.
 - Do not repeat passage labels, filenames, prompt instructions, or comments about your own answer.
 - Output only the answer itself, followed by inline source numbers.
 - Keep the answer concise, direct, and no longer than four paragraphs.
@@ -194,9 +196,11 @@ class RAGService:
         scope_term, _ = _rarest_term_scope(
             self.store, retrieval_query, max(top_k * 10, 20)
         )
+        comparison_facets = _comparison_facets(question)
         expanded_top_k = (
             max(top_k, 6)
             if top_k > 1
+            and not comparison_facets
             and not _has_named_anchor(question)
             and (scope_term or len(_meaningful_terms(retrieval_query)) >= 3)
             else top_k
@@ -211,6 +215,21 @@ class RAGService:
             )
         else:
             results = self.search(question, expanded_top_k, sources)
+
+        if comparison_facets:
+            focused_results = _filter_comparison_results(comparison_facets, results)
+            if focused_results:
+                results = focused_results[: max(top_k, len(comparison_facets))]
+
+        requested_profile_section = _requested_profile_section(question)
+        if requested_profile_section and sources:
+            result_sources = {result.source for result in results}
+            for source in sources:
+                if source in result_sources:
+                    continue
+                content = self.store.get_document_content(source)
+                if content:
+                    results.append(SearchResult(source, 0, content[:700], 1.0))
 
         structured = self._structured_document_answer(question, results)
         if structured is not None:
@@ -346,6 +365,19 @@ class RAGService:
                 if profile_answer:
                     return Answer(f"{profile_answer} [1]", [result])
 
+        requested_section = _requested_profile_section(question)
+        if requested_section:
+            heading, following_headings = requested_section
+            for result in unique_results:
+                section = _extract_section(
+                    self.store.get_document_content(result.source),
+                    heading,
+                    following_headings,
+                )
+                formatted = _format_profile_section(heading, section)
+                if formatted:
+                    return Answer(f"{formatted} [1]", [result])
+
         if _is_project_list_question(question):
             for result in unique_results:
                 section = _extract_section(
@@ -474,6 +506,45 @@ def _normalize_retrieval_query(question: str) -> str:
 def _is_project_list_question(question: str) -> bool:
     lowered = question.lower()
     return "project" in lowered or "proje" in lowered
+
+
+def _requested_profile_section(
+    question: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    terms = _meaningful_terms(question)
+    all_headings = (
+        "About Me",
+        "Education",
+        "Projects",
+        "Experience",
+        "Skills",
+        "Certificates",
+        "Sertificates",
+    )
+    if terms & {"experience", "experiences", "employment", "deneyim", "deneyimleri"}:
+        return "Experience", tuple(item for item in all_headings if item != "Experience")
+    if terms & {"skill", "skills", "yetenek", "yetenekler", "beceri", "beceriler"}:
+        return "Skills", tuple(item for item in all_headings if item != "Skills")
+    if terms & {"certificate", "certificates", "sertificate", "sertificates", "sertifika", "sertifikalar"}:
+        # Some CVs contain the misspelled heading "Sertificates".
+        return "Certificates", tuple(item for item in all_headings if item != "Certificates")
+    return None
+
+
+def _format_profile_section(heading: str, section: str) -> str:
+    if not section:
+        return ""
+    lines = []
+    for raw_line in section.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" \tâ€¢")
+        if not line or line.lower() == heading.lower():
+            continue
+        if re.fullmatch(r"\[Sayfa\s+\d+]", line, flags=re.IGNORECASE):
+            continue
+        lines.append(line)
+    if not lines:
+        return ""
+    return f"{heading}:\n" + "\n".join(f"- {line}" for line in lines)
 
 
 def _extract_section(
@@ -690,14 +761,23 @@ def _analyze_spreadsheet(question: str, content: str) -> str:
 
         if total_requested:
             filters: list[tuple[str, str]] = []
+            metric_terms = _meaningful_terms(metric)
             for header in headers:
                 if header == metric:
                     continue
                 for value in {row.get(header, "").strip() for row in rows}:
-                    if value and not _is_number(value) and value.lower() in lowered:
+                    value_terms = _meaningful_terms(value)
+                    describes_metric = bool(value_terms) and all(
+                        any(_terms_are_close(term, metric_term) for metric_term in metric_terms)
+                        for term in value_terms - {"total", "toplam"}
+                    )
+                    if (
+                        value
+                        and not _is_number(value)
+                        and value.lower() in lowered
+                        and not describes_metric
+                    ):
                         filters.append((header, value))
-            if not filters:
-                continue
             matching_rows = [
                 row
                 for row in rows
@@ -709,6 +789,8 @@ def _analyze_spreadsheet(question: str, content: str) -> str:
                 if _is_number(row.get(metric, ""))
             ]
             if values:
+                if not filters:
+                    return f"Total {metric}: {_format_metric_value(metric, sum(values))}."
                 filter_text = ", ".join(value for _, value in filters)
                 return f"Total {metric} for {filter_text}: {_format_metric_value(metric, sum(values))}."
     return ""
@@ -1139,6 +1221,25 @@ def _comparison_facets(question: str) -> list[str]:
     if turkish:
         return [turkish.group(1).strip(), turkish.group(2).strip()]
     return []
+
+
+def _filter_comparison_results(
+    facets: list[str], results: list[SearchResult]
+) -> list[SearchResult]:
+    facet_terms = [_meaningful_terms(facet) for facet in facets]
+    focused: list[SearchResult] = []
+    for result in results:
+        content_terms = _meaningful_terms(result.content)
+        if any(
+            terms
+            and all(
+                any(_terms_are_close(term, content_term) for content_term in content_terms)
+                for term in terms
+            )
+            for terms in facet_terms
+        ):
+            focused.append(result)
+    return focused
 
 
 def _validate_citations(text: str, source_count: int) -> str:

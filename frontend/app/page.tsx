@@ -632,7 +632,7 @@ export default function Home() {
               <div className="composer-controls">
                 <span>Search the <b>local RAG index</b></span>
                 <button type="submit" className="send-button" aria-label="Send question" disabled={isAsking || !query.trim()}>
-                  {isAsking ? "Thinking…" : "Send ↗"}
+                  {isAsking ? "Thinking…" : "Send"}
                 </button>
               </div>
             </div>

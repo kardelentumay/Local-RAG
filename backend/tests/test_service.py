@@ -9,12 +9,16 @@ from local_rag.service import (
     RAGService,
     _analyze_spreadsheet,
     _context_excerpt,
+    _extract_section,
     _extract_spreadsheet_summary,
+    _filter_comparison_results,
     _build_answer_prompt,
     _has_relevant_evidence,
     _hybrid_fuse,
     _normalize_retrieval_query,
     _person_profile_answer,
+    _requested_profile_section,
+    _format_profile_section,
     _rarest_term_sources,
     _rerank_section_matches,
     _validate_citations,
@@ -475,6 +479,35 @@ A5=Ege | B5=Keyboard | C5=120 | D5=35"""
             ),
         )
 
+    def test_spreadsheet_analysis_totals_all_rows_without_a_filter(self):
+        content = """[Ã‡alÄ±ÅŸma SayfasÄ±: Sales Data]
+A1=Region | B1=Revenue (TRY) | C1=Profit (TRY) | D1=Units Sold
+A2=Marmara | B2=100 | C2=30 | D2=4
+A3=Ege | B3=80 | C3=20 | D3=6
+A4=Marmara | B4=150 | C4=40 | D4=5"""
+        self.assertEqual(
+            "Total Revenue (TRY): 330 TRY.",
+            _analyze_spreadsheet("What is the total revenue?", content),
+        )
+        self.assertEqual(
+            "Total Profit (TRY): 90 TRY.",
+            _analyze_spreadsheet("What is the total profit?", content),
+        )
+        self.assertEqual(
+            "Total Units Sold: 15.",
+            _analyze_spreadsheet("How many total units were sold?", content),
+        )
+
+    def test_spreadsheet_metric_label_is_not_treated_as_a_filter(self):
+        content = """[Ã‡alÄ±ÅŸma SayfasÄ±: Analysis]
+A3=Metric | B3=Value | D3=Month | E3=Revenue (TRY) | F3=Profit (TRY)
+A4=Total Revenue | B4=3795460 | D4=January | E4=460750 | F4=125350
+A5=Total Profit | B5=1059650 | D5=February | E5=429160 | F5=123860"""
+        self.assertEqual(
+            "Total Revenue (TRY): 889,910 TRY.",
+            _analyze_spreadsheet("What is the total revenue?", content),
+        )
+
     def test_spreadsheet_analysis_finds_highest_month(self):
         content = """[Çalışma Sayfası: Analysis]
 D3=Month | E3=Revenue (TRY) | F3=Profit (TRY)
@@ -496,6 +529,58 @@ Eastern Mediterranean University"""
             "Kardelen Tumay is a recent Software Engineering graduate with practical experience in full-stack development and software design.",
             _person_profile_answer("Who is Kardelen?", content),
         )
+
+    def test_profile_section_questions_work_with_or_without_a_person_name(self):
+        self.assertEqual(
+            "Experience",
+            _requested_profile_section("What are Kardelen's experiences?")[0],
+        )
+        self.assertEqual(
+            "Experience",
+            _requested_profile_section("What is the work experience?")[0],
+        )
+        self.assertEqual(
+            "Skills",
+            _requested_profile_section("What are the skills?")[0],
+        )
+
+    def test_profile_section_formatter_keeps_only_requested_section(self):
+        content = """Experience
+Software Development Intern
+Built internal web applications.
+Skills
+Python, React, SQL"""
+        section = _extract_section(content, "Experience", ("Skills",))
+        self.assertEqual(
+            "Experience:\n- Software Development Intern\n- Built internal web applications.",
+            _format_profile_section("Experience", section),
+        )
+
+    def test_comparison_filter_removes_unrelated_document_sources(self):
+        results = [
+            SearchResult(
+                "cloud.pdf",
+                1,
+                "A private cloud is dedicated to one organization.",
+                0.8,
+            ),
+            SearchResult(
+                "cloud.pdf",
+                2,
+                "A public cloud provides shared infrastructure to multiple customers.",
+                0.7,
+            ),
+            SearchResult(
+                "cv.pdf",
+                4,
+                "Software engineering skills include React and SQLite.",
+                0.6,
+            ),
+        ]
+        filtered = _filter_comparison_results(
+            ["private cloud", "public cloud"], results
+        )
+        self.assertEqual(["cloud.pdf", "cloud.pdf"], [item.source for item in filtered])
 
 
 if __name__ == "__main__":
