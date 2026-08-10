@@ -52,12 +52,6 @@ const API_BASE_URL =
   process.env.NEXT_PUBLIC_LOCAL_RAG_API_URL ?? "http://127.0.0.1:8000";
 const CHAT_STORAGE_KEY = "nivora-chat-history-v1";
 
-const suggestions = [
-  "How does Corrective RAG work?",
-  "How does RAGAS measure faithfulness?",
-  "Compare agentic and traditional RAG.",
-];
-
 function renderAnswerText(
   text: string,
   sources: SourceItem[],
@@ -577,12 +571,6 @@ export default function Home() {
                 <strong>Hello, I&apos;m Nivi.</strong>
                 <p>I search your selected documents locally and support my answers with verifiable sources. What would you like to explore today?</p>
               </div>
-            </div>
-
-            <div className="suggestions">
-              {suggestions.map((suggestion) => (
-                <button key={suggestion} onClick={() => setQuery(suggestion)}>{suggestion}</button>
-              ))}
             </div>
 
             {exchanges.map((exchange) => (

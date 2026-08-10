@@ -226,8 +226,6 @@ body {
 .message-bubble { max-width: 680px; padding: 15px 17px; border-radius: 5px 16px 16px 16px; background: var(--white); border: 1px solid var(--line); box-shadow: 0 8px 26px rgba(44,47,85,.06); }
 .message-bubble strong { color: var(--navy); }
 .message-bubble p { margin: 7px 0 0; color: #4f4f63; font-size: 13px; line-height: 1.65; }
-.suggestions { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 26px 50px; }
-.suggestions button { border: 1px solid #ded3e6; background: var(--white); color: var(--purple); padding: 8px 10px; border-radius: 999px; font-size: 10px; }
 .user-message { margin: 0 0 20px auto; width: fit-content; max-width: 70%; padding: 13px 16px; border-radius: 16px 5px 16px 16px; background: var(--navy); color: var(--white); font-size: 13px; line-height: 1.55; }
 .answer { border-left: 3px solid var(--purple); }
 .answer-label { display: flex; justify-content: space-between; color: var(--purple); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
@@ -406,6 +404,5 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, input:focus-
   .source-panel { right: 0; overflow-y: auto; }
   .chat-content { width: calc(100% - 26px); }
   .composer { padding: 0 13px 14px; }
-  .suggestions { margin-left: 0; }
   .user-message { max-width: 88%; }
 }
