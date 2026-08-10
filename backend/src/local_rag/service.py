@@ -327,6 +327,11 @@ class RAGService:
         for result in unique_results:
             if Path(result.source).suffix.lower() != ".xlsx":
                 continue
+            analysis_answer = _analyze_spreadsheet(
+                question, self.store.get_document_content(result.source)
+            )
+            if analysis_answer:
+                return Answer(f"{analysis_answer} [1]", [result])
             summary_answer = _extract_spreadsheet_summary(
                 question, self.store.get_document_content(result.source)
             )
@@ -592,6 +597,154 @@ def _extract_spreadsheet_summary(question: str, content: str) -> str:
     if matched < 2 and coverage < 1.0:
         return ""
     return f"{label}: {_format_summary_number(label, value)}."
+
+
+def _analyze_spreadsheet(question: str, content: str) -> str:
+    lowered = question.lower()
+    highest_requested = any(
+        term in lowered
+        for term in ("highest", "largest", "most", "maximum", "en yüksek", "en fazla")
+    )
+    total_requested = any(term in lowered for term in ("total", "sum", "toplam"))
+    if not highest_requested and not total_requested:
+        return ""
+
+    tables = _spreadsheet_tables(content)
+    query_terms = _meaningful_terms(question)
+    for headers, rows in tables:
+        metric = _best_matching_header(
+            query_terms,
+            headers,
+            rows,
+            numeric=True,
+        )
+        if not metric:
+            continue
+
+        if highest_requested:
+            dimension = _best_matching_header(
+                query_terms,
+                headers,
+                rows,
+                numeric=False,
+            )
+            if not dimension:
+                continue
+            grouped: dict[str, float] = {}
+            for row in rows:
+                label = row.get(dimension, "").strip()
+                value = row.get(metric, "").strip()
+                if label and _is_number(value):
+                    grouped[label] = grouped.get(label, 0.0) + float(value.replace(",", ""))
+            if grouped:
+                label, value = max(grouped.items(), key=lambda item: item[1])
+                return f"{label} had the highest {metric}: {_format_metric_value(metric, value)}."
+
+        if total_requested:
+            filters: list[tuple[str, str]] = []
+            for header in headers:
+                if header == metric:
+                    continue
+                for value in {row.get(header, "").strip() for row in rows}:
+                    if value and not _is_number(value) and value.lower() in lowered:
+                        filters.append((header, value))
+            if not filters:
+                continue
+            matching_rows = [
+                row
+                for row in rows
+                if all(row.get(header, "").strip() == value for header, value in filters)
+            ]
+            values = [
+                float(row[metric].replace(",", ""))
+                for row in matching_rows
+                if _is_number(row.get(metric, ""))
+            ]
+            if values:
+                filter_text = ", ".join(value for _, value in filters)
+                return f"Total {metric} for {filter_text}: {_format_metric_value(metric, sum(values))}."
+    return ""
+
+
+def _spreadsheet_tables(content: str) -> list[tuple[list[str], list[dict[str, str]]]]:
+    sheet_rows: dict[str, dict[int, dict[str, str]]] = {}
+    current_sheet = "Workbook"
+    for line in content.splitlines():
+        sheet_match = re.match(r"\[Çalışma Sayfası:\s*(.+?)]", line.strip())
+        if sheet_match:
+            current_sheet = sheet_match.group(1)
+            sheet_rows.setdefault(current_sheet, {})
+            continue
+        for column, row_text, value in re.findall(
+            r"([A-Z]+)(\d+)=([^|]+?)(?=\s*\|\s*[A-Z]+\d+=|$)", line
+        ):
+            row_number = int(row_text)
+            sheet_rows.setdefault(current_sheet, {}).setdefault(row_number, {})[
+                column
+            ] = value.strip()
+
+    tables: list[tuple[list[str], list[dict[str, str]]]] = []
+    for rows_by_number in sheet_rows.values():
+        ordered = sorted(rows_by_number.items())
+        for header_index, (header_row_number, header_cells) in enumerate(ordered):
+            if len(header_cells) < 2 or not all(
+                value and not _is_number(value) for value in header_cells.values()
+            ):
+                continue
+            columns = sorted(header_cells, key=_column_number)
+            headers = [header_cells[column] for column in columns]
+            data_rows: list[dict[str, str]] = []
+            for row_number, cells in ordered[header_index + 1 :]:
+                if row_number <= header_row_number:
+                    continue
+                mapped = {
+                    header_cells[column]: cells.get(column, "")
+                    for column in columns
+                }
+                if sum(bool(value) for value in mapped.values()) >= 2:
+                    data_rows.append(mapped)
+            if data_rows:
+                tables.append((headers, data_rows))
+                break
+    return tables
+
+
+def _best_matching_header(
+    query_terms: set[str],
+    headers: list[str],
+    rows: list[dict[str, str]],
+    *,
+    numeric: bool,
+) -> str:
+    ranked: list[tuple[int, int, str]] = []
+    for header in headers:
+        values = [row.get(header, "") for row in rows if row.get(header, "")]
+        if not values:
+            continue
+        numeric_ratio = sum(_is_number(value) for value in values) / len(values)
+        if numeric != (numeric_ratio >= 0.7):
+            continue
+        header_terms = _meaningful_terms(header)
+        score = sum(
+            1
+            for query_term in query_terms
+            if any(_terms_are_close(query_term, header_term) for header_term in header_terms)
+        )
+        if score:
+            extra_terms = len(
+                {
+                    term
+                    for term in header_terms
+                    if not any(_terms_are_close(term, query_term) for query_term in query_terms)
+                }
+            )
+            ranked.append((score, -extra_terms, header))
+    return max(ranked, default=(0, 0, ""), key=lambda item: (item[0], item[1]))[2]
+
+
+def _format_metric_value(metric: str, value: float) -> str:
+    formatted = f"{int(value):,}" if value.is_integer() else f"{value:,.2f}"
+    return f"{formatted} TRY" if "try" in metric.lower() else formatted
 
 
 def _column_number(column: str) -> int:

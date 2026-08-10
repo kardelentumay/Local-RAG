@@ -7,6 +7,7 @@ from local_rag.service import (
     FALLBACK_ANSWER_EN,
     FALLBACK_ANSWER_TR,
     RAGService,
+    _analyze_spreadsheet,
     _context_excerpt,
     _extract_spreadsheet_summary,
     _build_answer_prompt,
@@ -452,6 +453,36 @@ class ServiceTests(unittest.TestCase):
             "What is the overall profit margin?", content
         )
         self.assertEqual("Overall Profit Margin: 27.9%.", answer)
+
+    def test_spreadsheet_analysis_groups_and_filters_rows(self):
+        content = """[Çalışma Sayfası: Sales Data]
+A1=Region | B1=Product | C1=Revenue (TRY) | D1=Profit (TRY)
+A2=Marmara | B2=Laptop | C2=100 | D2=30
+A3=Ege | B3=Keyboard | C3=80 | D3=20
+A4=Marmara | B4=Laptop | C4=150 | D4=40
+A5=Ege | B5=Keyboard | C5=120 | D5=35"""
+        self.assertEqual(
+            "Total Revenue (TRY) for Marmara: 250 TRY.",
+            _analyze_spreadsheet(
+                "What is the total revenue for the Marmara region?", content
+            ),
+        )
+        self.assertEqual(
+            "Laptop had the highest Profit (TRY): 70 TRY.",
+            _analyze_spreadsheet(
+                "Which product generated the highest profit?", content
+            ),
+        )
+
+    def test_spreadsheet_analysis_finds_highest_month(self):
+        content = """[Çalışma Sayfası: Analysis]
+D3=Month | E3=Revenue (TRY) | F3=Profit (TRY)
+D4=January | E4=460750 | F4=125350
+D5=June | E5=811000 | F5=237700"""
+        self.assertEqual(
+            "June had the highest Revenue (TRY): 811,000 TRY.",
+            _analyze_spreadsheet("Which month had the highest revenue?", content),
+        )
 
 
 if __name__ == "__main__":
