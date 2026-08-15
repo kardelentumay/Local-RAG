@@ -20,7 +20,7 @@ Local RAG/
 
 After models and documents are available locally, Nivora can run without internet access.
 
-## 1. Install and start the backend
+## 1. Install the backend for development or packaging
 
 Open PowerShell in the project root:
 
@@ -31,7 +31,7 @@ python -m venv .venv
 python -m pip install -e .
 ```
 
-Start the local API:
+Start the local API only when developing/testing the backend directly:
 
 ```powershell
 .\.venv\Scripts\local-rag-api.exe
@@ -46,7 +46,27 @@ Invoke-RestMethod http://127.0.0.1:8000/api/health
 Invoke-RestMethod http://127.0.0.1:8000/api/status
 ```
 
-## 2. Start the web interface
+## 2. Run Nivora as a desktop application (recommended)
+
+For normal use, open the installed Nivora Windows application. Electron starts the packaged FastAPI backend automatically; users do not need to open ports or run separate terminals.
+
+To run the desktop version from source:
+
+```powershell
+cd frontend
+npm install
+npm run desktop:dev
+```
+
+To create the installer:
+
+```powershell
+npm run desktop:package
+```
+
+The installer is generated under `frontend/release/`. Port 8000 is an internal local sidecar detail, not a user-facing web address.
+
+## 3. Optional web development mode
 
 Open a second PowerShell window:
 
@@ -56,9 +76,9 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000` in a browser. The frontend connects to the local API automatically.
+Open `http://localhost:3000` in a browser. This mode is only for frontend development and debugging; it connects to the local API at `http://127.0.0.1:8000`.
 
-## 3. Add documents
+## 4. Add documents
 
 You can upload documents from the Nivora interface. Supported formats:
 
@@ -79,7 +99,7 @@ local-rag ingest documents
 
 The Hugging Face download requires internet. Ingested files and the SQLite index remain local.
 
-## 4. Test a question from the CLI
+## 5. Test a question from the CLI
 
 ```powershell
 local-rag status
@@ -94,24 +114,6 @@ Available local chat models include:
 - `qwen2.5-0.5b`: faster and lighter, lower answer quality
 
 The Nivora UI and API default to `qwen2.5-1.5b`.
-
-## 5. Run the desktop application
-
-For development:
-
-```powershell
-cd frontend
-npm install
-npm run desktop:dev
-```
-
-To create a Windows installer:
-
-```powershell
-npm run desktop:package
-```
-
-The installer is generated under `frontend/release/`. Electron starts the packaged FastAPI executable as a local sidecar process. The application ID is `com.nivora.localrag` and the product name is `Nivora`.
 
 ## 6. Run tests
 
