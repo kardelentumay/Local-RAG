@@ -1,74 +1,189 @@
-# Local RAG Assistant - Phase 2
+# Nivora Local RAG
 
-Belge koleksiyonundan kaynak göstererek cevap üreten, tamamen yerel çalışan bir RAG uygulaması. Belgeler parçalara ayrılır, Microsoft Foundry Local ile vektörleştirilir, SQLite'ta saklanır ve en ilgili parçalar yerel sohbet modeline bağlam olarak verilir.
+Nivora, PDF, Markdown, TXT ve Excel belgelerini cihaz üzerinde indeksleyen, yerel dil modeliyle kaynaklı cevaplar üreten offline-first bir RAG asistanıdır. Proje Microsoft Summer School kapsamında geliştirilmiştir.
+
+## Öne çıkan özellikler
+
+- PDF, Markdown, TXT ve XLSX belge yükleme
+- Belge kategorileri, belge silme ve sohbet geçmişi
+- Semantic/vector search + SQLite FTS5/BM25 hibrit retrieval
+- Belge kapsamlı ve bölüm farkındalıklı arama
+- Kaynak belgesi, chunk numarası ve citation gösterimi
+- Alakasız sorular için güvenli fallback
+- Excel toplamları ve filtreli metrikler için deterministic analiz yolları
+- Yerel Qwen modelleri ve Microsoft Foundry Local
+- React arayüzü + FastAPI backend
+- Electron tabanlı Windows masaüstü uygulaması
+
+## Mimari
+
+```text
+React / Electron UI
+        |
+        v
+FastAPI local API (127.0.0.1:8000)
+        |
+        +--> SQLite + FTS5/BM25 keyword search
+        +--> embedding cosine similarity search
+        +--> hybrid rank fusion + relevance validation
+        +--> Foundry Local chat model
+```
+
+Ana backend modülleri:
+
+- `backend/src/local_rag/documents.py`: PDF, TXT, Markdown ve Excel okuma; chunk üretimi
+- `backend/src/local_rag/store.py`: SQLite, FTS5/BM25 ve embedding saklama
+- `backend/src/local_rag/service.py`: retrieval, belge kapsamı, section extraction, validation ve cevap orkestrasyonu
+- `backend/src/local_rag/api.py`: FastAPI endpoint’leri
+- `backend/src/local_rag/foundry.py`: embedding/chat model yaşam döngüsü
+- `frontend/app/page.tsx`: Nivora kullanıcı arayüzü
+- `frontend/electron/main.cjs`: Electron ana süreç ve backend sidecar yönetimi
 
 ## Gereksinimler
 
+- Windows 10/11 önerilir
 - Python 3.11+
-- Windows 10/11 (WinML paketi önerilir), macOS veya Linux
-- İlk model indirmesi için internet; sonraki çalıştırmalar çevrimdışı olabilir
+- Node.js 22.13+
+- İlk model ve veri indirmesi için internet
+- Model ve belgeler indirildikten sonra çalışma internet olmadan sürdürülebilir
 
-## Kurulum
+## Backend kurulumu
 
 ```powershell
+cd backend
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e .
 ```
 
-Windows dışındaki sistemlerde etkinleştirme komutu `source .venv/bin/activate` biçimindedir.
-
-## Kullanım
-
-Belgeleri `documents/` klasörüne koyun. Desteklenen türler: `.txt`, `.md`, `.pdf`.
+API’yi başlatmak için:
 
 ```powershell
+cd backend
+.venv\Scripts\local-rag-api.exe
+```
+
+API adresi: `http://127.0.0.1:8000`
+
+Yararlı endpoint’ler:
+
+- `GET /api/health`
+- `GET /api/status`
+- `GET /api/documents`
+- `POST /api/documents`
+- `DELETE /api/documents/{source}`
+- `POST /api/ask`
+- `GET /api/docs`
+
+## Frontend geliştirme
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Geliştirme arayüzü varsayılan olarak `http://localhost:3000` adresinde açılır. Frontend, yerel FastAPI backend’e bağlanır.
+
+## CLI kullanımı
+
+```powershell
+cd backend
+.venv\Scripts\Activate.ps1
+
 local-rag download-hf --topic rag --limit 20
 local-rag ingest documents
 local-rag status
-local-rag search "Kayıt şartları nelerdir?"
-local-rag ask "Kayıt şartları nelerdir?"
-local-rag chat
+local-rag search "What is corrective RAG?"
+local-rag ask "What is corrective RAG?" --top-k 2
+local-rag --chat-model qwen2.5-1.5b chat --top-k 2
 ```
 
-`download-hf`, varsayılan olarak `GXMZU/llm-rag-agent-papers` veri setinden seçilen bölümdeki makaleleri `documents/huggingface/<konu>/` içine ayrı Markdown dosyaları olarak indirir. Konular `rag`, `llm` ve `agent`; limit aralığı 1–100'dür. İndirme sırasında internet gerekir, sonrasında belgeler yerel kalır.
+Hugging Face indirme işlemi internet gerektirir. İndirilen Markdown belgeleri yerel `documents/huggingface/` altında tutulur.
 
-İlk `ingest` çağrısı embedding modelini, ilk `ask` çağrısı sohbet modelini indirip yükleyebilir. Varsayılanlar:
+## Model seçenekleri
 
-- Embedding: `qwen3-embedding-0.6b`
-- Chat: `qwen2.5-0.5b` (hız odaklı varsayılan; daha yüksek kalite için `qwen2.5-1.5b` seçilebilir)
-- Veritabanı: `data/knowledge.db`
+- `qwen2.5-1.5b`: Daha iyi bağlam ve cevap kalitesi; daha yüksek RAM ve gecikme
+- `qwen2.5-0.5b`: Daha düşük bellek kullanımı ve daha hızlı cevap; daha sınırlı reasoning
+- Embedding modeli: `qwen3-embedding-0.6b`
 
-Farklı ayarlar komut seçenekleriyle verilebilir:
+API ve Nivora arayüzündeki varsayılan chat modeli `qwen2.5-1.5b` olarak ayarlanmıştır. CLI’de hız için `qwen2.5-0.5b` seçilebilir.
+
+## Retrieval yaklaşımı
+
+Nivora tek bir arama yöntemine dayanmaz:
+
+1. Soru embedding’e çevrilir ve cosine similarity ile semantic sonuçlar bulunur.
+2. Aynı soru SQLite FTS5/BM25 ile keyword olarak aranır.
+3. İki sonuç listesi rank tabanlı hibrit füzyonla birleştirilir.
+4. Özel ad içeren sorularda belge kapsamı ve proje/section başlıkları dikkate alınır.
+5. İlgisiz evidence varsa model çağrılmadan güvenli fallback döndürülür.
+6. Cevap citation’ları kaynak sayısına göre doğrulanır.
+
+Deterministic işlemler, dil modelinin tahminine bırakılmaz. Excel toplamları, filtreli metrikler, glossary tanımları ve bazı profil bölümleri doğrudan kod tabanlı analizle ele alınır.
+
+## Masaüstü uygulaması
+
+Electron uygulaması backend’i yerel bir sidecar process olarak başlatır. Paketleme için:
 
 ```powershell
-local-rag --db data/notes.db --embedding-model qwen3-embedding-0.6b ingest documents --chunk-size 700 --overlap 100
-local-rag --chat-model qwen2.5-1.5b ask "Soru" --top-k 2
+cd frontend
+npm run desktop:backend
+npm run desktop:build
+npm run desktop:package
 ```
 
-`ingest`, aynı dosya değişmemişse onu yeniden işlemez; değişmiş dosyanın eski parçalarını atomik olarak yeniler. Cevap bağlamda yoksa sistem tahmin yürütmemesi için yönlendirilir. Çıktıda kullanılan kaynak ve benzerlik puanları ayrıca gösterilir.
+Installer çıktısı `frontend/release/` altında oluşturulur. Uygulama, backend’i `127.0.0.1` üzerinde çalıştırır; belgeler ve modeller cihazda kalır.
 
-Uzun makale koleksiyonlarını daha hızlı indekslemek için batch boyutu artırılabilir:
+## Testler
 
-```powershell
-local-rag ingest documents\huggingface\rag --batch-size 64
-```
-
-## Mimari
-
-1. `documents.py`: TXT/Markdown/PDF okuma ve örtüşmeli parçalara ayırma.
-2. `foundry.py`: Foundry Local model yaşam döngüsü, embedding ve chat çağrıları.
-3. `store.py`: SQLite şeması, FTS5/BM25 anahtar kelime araması ve cosine vector retrieval.
-4. `service.py`: Reciprocal Rank Fusion tabanlı hybrid retrieval ve RAG orkestrasyonu.
-5. `cli.py`: `ingest`, `search`, `ask`, `chat`, `status` arayüzü.
-
-Koleksiyon küçük tutulduğu için vektörler SQLite'tan belleğe alınıp cosine similarity Python'da hesaplanır. Semantic ve BM25 sıralamaları Reciprocal Rank Fusion ile birleştirilir; aynı makaleden en fazla iki parça seçilir. Varsayılan chunk ayarı 700 karakter ve 100 karakter örtüşmedir. Büyük koleksiyonlarda özel bir vektör indeksi gerekir.
-
-## Test
+Backend testleri:
 
 ```powershell
+cd backend
 $env:PYTHONPATH="src"
 python -m unittest discover -s tests -v
 ```
 
-Testler Foundry modeli indirmez; deterministik sahte embedding/chat adaptörleri kullanır.
+Frontend testleri:
+
+```powershell
+cd frontend
+npm test
+npm run lint
+```
+
+Test kapsamı; ingest idempotency, PDF/Excel okuma, FTS araması, hibrit fusion, relevance validation, citation kontrolü, belge silme ve API davranışlarını içerir.
+
+## Veri ve gizlilik
+
+- Belgeler varsayılan olarak yerel `backend/documents/` altında tutulur.
+- Bilgi tabanı `backend/data/knowledge.db` dosyasındadır.
+- API yalnızca localhost üzerinde çalışır.
+- İlk model indirmesinden sonra cevap üretimi için internet gerekmez.
+- Hassas belgeleri Git’e eklemeyin; `documents/uploads/` ve yerel veritabanı dosyaları proje kaynak kodundan ayrı tutulmalıdır.
+
+## Bilinen sınırlamalar
+
+- 0.5B model karmaşık karşılaştırma ve uzun liste sorularında 1.5B modele göre daha fazla hata yapabilir.
+- İlk model çağrısı lazy loading nedeniyle sonraki çağrılardan daha yavaştır.
+- Çok büyük koleksiyonlarda SQLite üzerinde Python cosine search yerine özel bir vector index gerekebilir.
+- PDF metin düzeni bozuksa section sınırları ve tablo yapısı etkilenebilir.
+
+## Proje yapısı
+
+```text
+Local RAG/
+├── backend/
+│   ├── src/local_rag/
+│   ├── tests/
+│   ├── documents/
+│   ├── data/
+│   └── pyproject.toml
+├── frontend/
+│   ├── app/
+│   ├── electron/
+│   ├── public/
+│   └── package.json
+└── README.md
+```
